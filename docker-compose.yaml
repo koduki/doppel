@@ -1,0 +1,9 @@
+version: '3.8'
+services:
+  app:
+    build: .
+    ports:
+      - "4568:4568"
+    volumes:
+      - .:/usr/src/app
+    command: ["bundle", "exec", "ruby", "app.rb", "-o", "0.0.0.0"]
