@@ -14,7 +14,7 @@ RUN bundle install
 COPY . .
 
 # Expose the port the app runs on
-EXPOSE 4568
+EXPOSE 8080
 
 # The command to run the application
 CMD ["bundle", "exec", "ruby", "app.rb", "-o", "0.0.0.0"]
