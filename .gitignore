@@ -1,0 +1,22 @@
+# Environment variables
+.env
+
+# Node.js
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Ruby
+.bundle/
+.byebug_history
+Gemfile.lock
+*.gem
+*.rbc
+capybara-*.html
+.rspec
+coverage/
+spec/reports/
+tmp/
+
+# Docker
+docker-compose.override.yml

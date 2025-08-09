@@ -7,6 +7,7 @@ require 'json'
 require 'net/http'
 require 'uri'
 require 'websocket-client-simple'
+require 'logger'
 
 set :port, ENV.fetch('PORT', '8080').to_i
 set :bind, '0.0.0.0'
@@ -23,6 +24,22 @@ configure do
   set :logging, true
 end
 
+# リクエストスコープ外でも使えるアプリ共通ロガー
+APP_LOGGER = Logger.new($stdout)
+case ENV.fetch('LOG_LEVEL', 'INFO').to_s.upcase
+when 'DEBUG'
+  APP_LOGGER.level = Logger::DEBUG
+when 'INFO'
+  APP_LOGGER.level = Logger::INFO
+when 'WARN', 'WARNING'
+  APP_LOGGER.level = Logger::WARN
+when 'ERROR'
+  APP_LOGGER.level = Logger::ERROR
+else
+  APP_LOGGER.level = Logger::INFO
+end
+APP_LOGGER.progname = 'app'
+
 # タイムアウト関連の環境変数（デフォルトは既存値を維持）
 SSE_TIMEOUT_SEC = Integer(ENV.fetch('SSE_TIMEOUT_SEC', '30'))
 DISCORD_WAIT_TIMEOUT_SEC = Integer(ENV.fetch('DISCORD_WAIT_TIMEOUT_SEC', '20'))
@@ -30,7 +47,7 @@ HTTP_OPEN_TIMEOUT_SEC = ENV['HTTP_OPEN_TIMEOUT_SEC']&.strip
 HTTP_READ_TIMEOUT_SEC = ENV['HTTP_READ_TIMEOUT_SEC']&.strip
 
 # 接続先を環境変数から指定できるようにする
-APP_BACKEND_ORIGIN = ENV.fetch('APP_BACKEND_ORIGIN', 'http://34.68.145.5/')
+APP_BACKEND_ORIGIN = ENV.fetch('APP_BACKEND_ORIGIN', 'http://localhost:3000/')
 
 def to_ws_url(origin)
   uri = URI(origin)
@@ -61,51 +78,6 @@ get '/' do
   erb :index, locals: { backend_http: BACKEND_HTTP, backend_ws: BACKEND_WS, app_env: ENV.fetch('APP_ENV', 'development') }
 end
 
-# Discord HTTP Interactions entrypoint for Cloud Run
-post '/interactions' do
-  request.body.rewind
-  raw_body = request.body.read
-  ts  = request.env['HTTP_X_SIGNATURE_TIMESTAMP']
-  sig = request.env['HTTP_X_SIGNATURE_ED25519']
-
-  logger.info("[INT] ts.len=#{ts&.length} sig.len=#{sig&.length} body.len=#{raw_body.bytesize} pk.len=#{DISCORD_PUBLIC_KEY&.length}")
-  halt 401, 'Bad request signature' unless valid_discord_signature?(ts, raw_body, sig)
-
-  payload = JSON.parse(raw_body) rescue {}
-  itype = payload['type']
-
-  # PING -> PONG
-  if itype == 1
-    content_type :json
-    return JSON.dump(type: 1)
-  end
-
-  # スラッシュコマンド（APPLICATION_COMMAND）
-  if itype == 2
-    token  = payload['token']
-    app_id = DISCORD_APP_ID
-  
-    Thread.new do
-      begin
-        user_prompt   = extract_prompt(payload)
-        response_text = fetch_response_via_backend(user_prompt)
-        edit_original_response(token, app_id, response_text)
-
-        # sleep 5  # ← ここで待つのはOK（ACKはもう返している）
-        # edit_original_response(token, app_id, "pong! ✅ (no backend)")
-      rescue => e
-        logger.error "[INT] edit error: #{e.class}: #{e.message}"
-      end
-    end
-  
-    content_type :json
-    logger.info "[INT] defer sent" 
-    return JSON.dump(type: 5)  # ACKだけ即返す（3秒以内）
-  end
-
-  # それ以外（ボタン等）は未対応なら204
-  status 204
-end
 
 # ブラウザからはHTTPS同一オリジンでSSEに接続し、バックエンド(HTTP/WS)の結果を中継する
 get '/stream' do
@@ -169,140 +141,108 @@ end
 # グローバルエラーハンドラ
 error do
   e = env['sinatra.error']
-  logger.error("[ERROR] #{e.class}: #{e.message}\n#{e.backtrace&.join("\n")}")
+  APP_LOGGER.error("[ERROR] #{e.class}: #{e.message}\n#{e.backtrace&.join("\n")}")
   status 500
   content_type :json
   { error: e.message }.to_json
 end
 
-helpers do
-  def valid_discord_signature?(timestamp, body, signature)
-    return false if DISCORD_PUBLIC_KEY.to_s.strip.empty?
-    return false if timestamp.to_s.empty? || signature.to_s.empty? || body.nil?
+# --- Helper methods (moved to top-level for global access) ---
 
-    verify_key = Ed25519::VerifyKey.new([DISCORD_PUBLIC_KEY].pack('H*'))
-    verify_key.verify([signature].pack('H*'), timestamp + body)
-    true
-  rescue Ed25519::VerifyError, ArgumentError => e
-    logger.warn "[INT] verify failed: #{e.class}: #{e.message}"
-    false
+def valid_discord_signature?(timestamp, body, signature)
+  return false if DISCORD_PUBLIC_KEY.to_s.strip.empty?
+  return false if timestamp.to_s.empty? || signature.to_s.empty? || body.nil?
+
+  verify_key = Ed25519::VerifyKey.new([DISCORD_PUBLIC_KEY].pack('H*'))
+  verify_key.verify([signature].pack('H*'), timestamp + body)
+  true
+rescue Ed25519::VerifyError, ArgumentError => e
+  APP_LOGGER.warn "[INT] verify failed: #{e.class}: #{e.message}"
+  false
+end
+
+def extract_prompt(interaction)
+  APP_LOGGER.info "[INT] payload: #{interaction}"
+
+  # スラッシュコマンドのオプションやメッセージ内容からテキストを抽出
+  if interaction['data'] && interaction['data']['options']&.any?
+    first = interaction['data']['options'].first
+    first['value'].to_s
+  elsif interaction['data'] && interaction['data']['name']
+    interaction['data']['name'].to_s
+  else
+    'こんにちは'
+  end
+end
+
+# 共通化: バックエンド(HTTP/WS)と会話ストリームを開始し、与えられたコールバックで処理する
+def start_backend_stream(prompt, timeout_sec:, app_logger:, on_chunk:, on_end:, on_error:)
+  session_id = create_session
+  app_logger.info("[BACKEND] session created id=#{session_id}")
+
+  ws = WebSocket::Client::Simple.connect(BACKEND_WS)
+  app_logger.info("[BACKEND] WS connecting to #{BACKEND_WS}")
+
+  state_mutex = Mutex.new
+  finished = false
+  sent_message = false
+
+  ws.on(:open) do
+    app_logger.info('[WS] open')
+    ws.send({ type: 'init', sessionId: session_id }.to_json)
   end
 
-  def extract_prompt(interaction)
-    logger.info "[INT] payload: #{interaction}"
-
-    # スラッシュコマンドのオプションやメッセージ内容からテキストを抽出
-    if interaction['data'] && interaction['data']['options']&.any?
-      first = interaction['data']['options'].first
-      first['value'].to_s
-    elsif interaction['data'] && interaction['data']['name']
-      interaction['data']['name'].to_s
-    else
-      'こんにちは'
+  ws.on(:error) do |e|
+    state_mutex.synchronize do
+      unless finished
+        app_logger.error("[WS] error #{e}")
+      end
     end
   end
 
-  # 共通化: バックエンド(HTTP/WS)と会話ストリームを開始し、与えられたコールバックで処理する
-  def start_backend_stream(prompt, timeout_sec:, app_logger:, on_chunk:, on_end:, on_error:)
-    session_id = create_session
-    app_logger.info("[BACKEND] session created id=#{session_id}")
-
-    ws = WebSocket::Client::Simple.connect(BACKEND_WS)
-    app_logger.info("[BACKEND] WS connecting to #{BACKEND_WS}")
-
-    state_mutex = Mutex.new
-    finished = false
-    sent_message = false
-
-    ws.on(:open) do
-      app_logger.info('[WS] open')
-      ws.send({ type: 'init', sessionId: session_id }.to_json)
-    end
-
-    ws.on(:error) do |e|
-      state_mutex.synchronize do
-        unless finished
-          app_logger.error("[WS] error #{e}")
-        end
+  ws.on(:close) do |e|
+    state_mutex.synchronize do
+      if finished
+        app_logger.debug("[WS] close after finished #{e}")
+      else
+        app_logger.info("[WS] close #{e}")
       end
     end
+  end
 
-    ws.on(:close) do |e|
-      state_mutex.synchronize do
-        if finished
-          app_logger.debug("[WS] close after finished #{e}")
-        else
-          app_logger.info("[WS] close #{e}")
-        end
-      end
+  ws.on(:message) do |evt|
+    app_logger.info("[WS] message raw=#{evt.data}")
+    msg = JSON.parse(evt.data) rescue nil
+    unless msg
+      app_logger.warn('[WS] non-JSON message ignored')
+      next
     end
+    app_logger.info("[WS] message type=#{msg['type']}")
 
-    ws.on(:message) do |evt|
-      app_logger.info("[WS] message raw=#{evt.data}")
-      msg = JSON.parse(evt.data) rescue nil
-      unless msg
-        app_logger.warn('[WS] non-JSON message ignored')
-        next
+    case msg['type']
+    when 'ready'
+      app_logger.info('[WS] ready received')
+      unless sent_message
+        ws.send({ type: 'message', content: prompt }.to_json)
+        sent_message = true
+        app_logger.info("[WS] message sent: #{prompt.inspect}")
       end
-      app_logger.info("[WS] message type=#{msg['type']}")
-
-      case msg['type']
-      when 'ready'
-        app_logger.info('[WS] ready received')
-        unless sent_message
-          ws.send({ type: 'message', content: prompt }.to_json)
-          sent_message = true
-          app_logger.info("[WS] message sent: #{prompt.inspect}")
-        end
-      when 'stream_chunk'
-        if msg.dig('data', 'type') == 'content'
-          chunk = msg.dig('data', 'data')
-          if chunk && !chunk.empty?
-            state_mutex.synchronize do
-              unless finished
-                on_chunk.call(chunk)
-              end
+    when 'stream_chunk'
+      if msg.dig('data', 'type') == 'content'
+        chunk = msg.dig('data', 'data')
+        if chunk && !chunk.empty?
+          state_mutex.synchronize do
+            unless finished
+              on_chunk.call(chunk)
             end
-          else
-            app_logger.info('[WS] Empty chunk ignored')
           end
         else
-          app_logger.info("[WS] stream_chunk but not content type: #{msg.dig('data', 'type')}")
-        end
-      when 'stream_end'
-        should_close = false
-        state_mutex.synchronize do
-          unless finished
-            finished = true
-            should_close = true
-          end
-        end
-        if should_close
-          app_logger.info('[WS] stream_end')
-          on_end.call
-          ws.close
-        end
-      when 'error'
-        err = msg['error']
-        should_close = false
-        state_mutex.synchronize do
-          unless finished
-            finished = true
-            should_close = true
-          end
-        end
-        if should_close
-          app_logger.error("[WS] backend error: #{err}")
-          on_error.call(err)
-          ws.close
+          app_logger.info('[WS] Empty chunk ignored')
         end
       else
-        app_logger.info("[WS] unknown message type=#{msg['type']}, data=#{msg['data'].inspect}")
+        app_logger.info("[WS] stream_chunk but not content type: #{msg.dig('data', 'type')}")
       end
-    end
-
-    timeout_thread = Thread.new do
-      sleep timeout_sec
+    when 'stream_end'
       should_close = false
       state_mutex.synchronize do
         unless finished
@@ -311,101 +251,244 @@ helpers do
         end
       end
       if should_close
-        begin
-          app_logger.error("[BACKEND] timeout #{timeout_sec}s reached (prompt=#{prompt.inspect})")
-          on_error.call('timeout')
-          ws.close
-        rescue => te
-          app_logger.error("[BACKEND] timeout cleanup error: #{te}")
+        app_logger.info('[WS] stream_end')
+        on_end.call
+        ws.close
+      end
+    when 'error'
+      err = msg['error']
+      should_close = false
+      state_mutex.synchronize do
+        unless finished
+          finished = true
+          should_close = true
         end
       end
+      if should_close
+        app_logger.error("[WS] backend error: #{err}")
+        on_error.call(err)
+        ws.close
+      end
+    else
+      app_logger.info("[WS] unknown message type=#{msg['type']}, data=#{msg['data'].inspect}")
     end
-
-    { ws: ws, timeout_thread: timeout_thread }
   end
 
-  def fetch_response_via_backend(prompt)
-    logger.info('[DISCORD] fetch_response_via_backend start')
+  timeout_thread = Thread.new do
+    sleep timeout_sec
+    should_close = false
+    state_mutex.synchronize do
+      unless finished
+        finished = true
+        should_close = true
+      end
+    end
+    if should_close
+      begin
+        app_logger.error("[BACKEND] timeout #{timeout_sec}s reached (prompt=#{prompt.inspect})")
+        on_error.call('timeout')
+        ws.close
+      rescue => te
+        app_logger.error("[BACKEND] timeout cleanup error: #{te}")
+      end
+    end
+  end
 
-    collected = String.new
-    mutex = Mutex.new
-    cond = ConditionVariable.new
-    done = false
+  { ws: ws, timeout_thread: timeout_thread }
+end
 
-    controller = start_backend_stream(
-      prompt,
-      timeout_sec: DISCORD_WAIT_TIMEOUT_SEC,
+def fetch_response_via_backend(prompt)
+  APP_LOGGER.info('[DISCORD] fetch_response_via_backend start')
+
+  collected = String.new
+  mutex = Mutex.new
+  cond = ConditionVariable.new
+  done = false
+
+  controller = start_backend_stream(
+    prompt,
+    timeout_sec: DISCORD_WAIT_TIMEOUT_SEC,
+    app_logger: APP_LOGGER,
+    on_chunk: ->(chunk) {
+      APP_LOGGER.info("[DISCORD] chunk content: #{chunk.to_s.inspect[0..100]}")
+      collected << chunk.to_s
+    },
+    on_end: -> {
+      APP_LOGGER.info("[DISCORD] stream_end received, collected: #{collected.length} chars")
+      mutex.synchronize { done = true; cond.signal }
+    },
+    on_error: ->(err) {
+      APP_LOGGER.error("[DISCORD] error: #{err}")
+      collected << "\n[Error] #{err}"
+      mutex.synchronize { done = true; cond.signal }
+    }
+  )
+
+  mutex.synchronize { cond.wait(mutex) unless done }
+
+  controller[:timeout_thread]&.kill
+  controller[:ws]&.close
+
+  collected.empty? ? '応答がありませんでした。' : collected
+end
+
+def create_session
+  uri = URI.parse(BACKEND_HTTP)
+  APP_LOGGER.info("[create_session] Connecting to #{uri}")
+  http = Net::HTTP.new(uri.host, uri.port)
+  http.use_ssl = uri.scheme == 'https'
+
+  # HTTPの接続/読み込みタイムアウト（環境変数で設定があれば適用）
+  http.open_timeout = Integer(HTTP_OPEN_TIMEOUT_SEC) if HTTP_OPEN_TIMEOUT_SEC && !HTTP_OPEN_TIMEOUT_SEC.empty?
+  http.read_timeout = Integer(HTTP_READ_TIMEOUT_SEC) if HTTP_READ_TIMEOUT_SEC && !HTTP_READ_TIMEOUT_SEC.empty?
+
+  req = Net::HTTP::Post.new(uri.request_uri)
+  res = http.request(req)
+
+  unless res.is_a?(Net::HTTPSuccess)
+    APP_LOGGER.error("[BACKEND] session failed code=#{res.code} body=#{res.body}")
+    raise "セッション作成に失敗しました (#{res.code})"
+  end
+
+  body = JSON.parse(res.body)
+  sid = body['sessionId']
+  unless sid
+    APP_LOGGER.error("[BACKEND] session ok but sessionId missing body=#{res.body}")
+    raise 'sessionId が取得できませんでした'
+  end
+  APP_LOGGER.info("[create_session] Session created: #{sid}")
+  sid
+end
+
+def edit_original_response(token, app_id, content)
+  uri  = URI("https://discord.com/api/v10/webhooks/#{app_id}/#{token}/messages/@original")
+  http = Net::HTTP.new(uri.host, uri.port); http.use_ssl = true
+  http.open_timeout = 5; http.read_timeout = 10
+
+  req = Net::HTTP::Patch.new(uri.request_uri, { 'Content-Type' => 'application/json' })
+  req.body = { content: content }.to_json
+
+  3.times do |i|
+    res = http.request(req)
+    APP_LOGGER.info "[INT] edit original: #{res.code} #{res.body}"
+    return true if res.is_a?(Net::HTTPSuccess)
+    if res.code == '429'
+      sleep((res['Retry-After'] || 0.5).to_f)
+      next
+    end
+    break
+  end
+  false
+end
+
+
+# --- Discord Gateway (discorb) を同居起動 ---------------------------------
+# Gemfile に `gem 'discorb'` を追加して bundle install 済みを想定
+if DISCORD_TOKEN && !DISCORD_TOKEN.empty?
+  require "discorb"
+
+  # 利用するインテントを明示的に指定 (discorb v0.20.0)
+  intents = Discorb::Intents.new(
+    guilds: true,          # サーバー情報の取得に必要
+    messages: true,        # サーバー/DMでのメッセージ受信に必要
+    message_content: true  # メッセージ内容の取得に必要 (特権)
+  )
+
+  CLIENT = Discorb::Client.new(intents: intents)
+
+  # メンション表記を本文から除去
+  def strip_bot_mention(client, content)
+    bot_id = client.user.id
+    content.gsub(/<@!?#{bot_id}>\s*/, "").strip
+  end
+
+  # 受けテキストをチャットAPIにストリーム連携→Discord側に段階編集で反映
+  def stream_reply_via_backend_dsc(message, text, timeout: DISCORD_WAIT_TIMEOUT_SEC, logger:)
+    # プレースホルダ送信（ここを随時 edit）
+    msg = message.channel.post("…")
+    buffer = +""
+    last_edit = Time.now
+
+    start_backend_stream(
+      text,
+      timeout_sec: timeout,
       app_logger: logger,
       on_chunk: ->(chunk) {
-        logger.info("[DISCORD] chunk content: #{chunk.to_s.inspect[0..100]}")
-        collected << chunk.to_s
+        buffer << chunk.to_s
+        # レート制限対策：1秒おき or 200文字ごとに控えめに編集
+        if (Time.now - last_edit) >= 1 || buffer.length >= 200
+          begin
+            msg.edit(buffer)
+          rescue => e
+            logger.warn "[GW] edit failed: #{e.class}: #{e.message}"
+            # もし edit が失敗したら控えめに追記投稿（最小限のフォールバック）
+            begin
+              msg = message.channel.post(buffer)
+            rescue => e2
+              logger.error "[GW] post fallback failed: #{e2.class}: #{e2.message}"
+            end
+          ensure
+            last_edit = Time.now
+          end
+        end
       },
       on_end: -> {
-        logger.info("[DISCORD] stream_end received, collected: #{collected.length} chars")
-        mutex.synchronize { done = true; cond.signal }
+        begin
+          msg.edit(buffer.empty? ? "(empty)" : buffer)
+        rescue => e
+          logger.warn "[GW] final edit failed: #{e.class}: #{e.message}"
+          message.channel.post(buffer.empty? ? "(empty)" : buffer) rescue nil
+        end
       },
       on_error: ->(err) {
-        logger.error("[DISCORD] error: #{err}")
-        collected << "\n[Error] #{err}"
-        mutex.synchronize { done = true; cond.signal }
+        begin
+          msg.edit("エラー: #{err}")
+        rescue
+          message.channel.post("エラー: #{err}") rescue nil
+        end
       }
     )
-
-    mutex.synchronize { cond.wait(mutex) unless done }
-
-    controller[:timeout_thread]&.kill
-    controller[:ws]&.close
-
-    collected.empty? ? '応答がありませんでした。' : collected
   end
 
-  def create_session
-    uri = URI.parse(BACKEND_HTTP)
-    logger.info("[create_session] Connecting to #{uri}")
-    http = Net::HTTP.new(uri.host, uri.port)
-    http.use_ssl = uri.scheme == 'https'
-
-    # HTTPの接続/読み込みタイムアウト（環境変数で設定があれば適用）
-    http.open_timeout = Integer(HTTP_OPEN_TIMEOUT_SEC) if HTTP_OPEN_TIMEOUT_SEC && !HTTP_OPEN_TIMEOUT_SEC.empty?
-    http.read_timeout = Integer(HTTP_READ_TIMEOUT_SEC) if HTTP_READ_TIMEOUT_SEC && !HTTP_READ_TIMEOUT_SEC.empty?
-
-    req = Net::HTTP::Post.new(uri.request_uri)
-    res = http.request(req)
-
-    unless res.is_a?(Net::HTTPSuccess)
-      logger.error("[BACKEND] session failed code=#{res.code} body=#{res.body}")
-      raise "セッション作成に失敗しました (#{res.code})"
-    end
-
-    body = JSON.parse(res.body)
-    sid = body['sessionId']
-    unless sid
-      logger.error("[BACKEND] session ok but sessionId missing body=#{res.body}")
-      raise 'sessionId が取得できませんでした'
-    end
-    logger.info("[create_session] Session created: #{sid}")
-    sid
+  CLIENT.once :standby do
+    APP_LOGGER.info "[GW] discorb logged in as #{CLIENT.user}"
   end
 
-  def edit_original_response(token, app_id, content)
-    uri  = URI("https://discord.com/api/v10/webhooks/#{app_id}/#{token}/messages/@original")
-    http = Net::HTTP.new(uri.host, uri.port); http.use_ssl = true
-    http.open_timeout = 5; http.read_timeout = 10
-  
-    req = Net::HTTP::Patch.new(uri.request_uri, { 'Content-Type' => 'application/json' })
-    req.body = { content: content }.to_json
-  
-    3.times do |i|
-      res = http.request(req)
-      logger.info "[INT] edit original: #{res.code} #{res.body}"
-      return true if res.is_a?(Net::HTTPSuccess)
-      if res.code == '429'
-        sleep((res['Retry-After'] || 0.5).to_f)
-        next
+  # 反応条件：DM か、Botがメンションされたメッセージのみ
+  CLIENT.on :message do |message|
+    begin
+      next if message.author.bot?
+      is_dm = message.channel.is_a?(Discorb::DMChannel)
+      
+      # サーバーでのメンションかDMかを判定
+      mentioned = false
+      unless is_dm
+        # `mentions` がないため `mentioned_users` を試す
+        if message.respond_to?(:mentioned_users)
+          mentioned = message.mentioned_users.any? { |u| u.id == CLIENT.user.id }
+        elsif message.respond_to?(:mentions) # 古いバージョンのためのフォールバック
+          mentioned = message.mentions.any? { |u| u.id == CLIENT.user.id }
+        end
       end
-      break
+
+      APP_LOGGER.info "[GW] message received: author=#{message.author.name}, dm=#{is_dm}, mentioned=#{mentioned}, content=#{message.content.inspect}"
+      next unless is_dm || mentioned
+
+      text = mentioned ? strip_bot_mention(CLIENT, message.content) : message.content
+      text = "こんにちは" if text.strip.empty?
+
+      stream_reply_via_backend_dsc(message, text, logger: APP_LOGGER)
+    rescue => e
+      APP_LOGGER.error "[GW] handler error: #{e.class}: #{e.message}"
+      message.channel.post("ごめん、内部エラー: #{e.message}") rescue nil
     end
-    false
   end
 
+  # Sinatra と同居するため別スレッドで Async ループを起動
+  Thread.new do
+    APP_LOGGER.info "[GW] starting discorb gateway..."
+    CLIENT.run(DISCORD_TOKEN)
+  end
+else
+  puts "[GW] DISCORD_TOKEN 未設定のため、discorb Gateway は起動しません"
 end
