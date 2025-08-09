@@ -11,15 +11,29 @@ require 'websocket-client-simple'
 set :port, ENV.fetch('PORT', '8080').to_i
 set :bind, '0.0.0.0'
 
-BACKEND_HTTP = ENV.fetch('BACKEND_HTTP', 'http://34.172.102.142:3000/api/chat')
-BACKEND_WS   = ENV.fetch('BACKEND_WS',   'ws://34.172.102.142:3000/')
+# Host Authorization を無効化（Cloud Runのrun.appドメインを許可するため）
+configure do
+  disable :protection
+end
+
+# 接続先を環境変数から指定できるようにする
+APP_BACKEND_ORIGIN = ENV.fetch('APP_BACKEND_ORIGIN', 'http://34.68.145.5/')
+
+def to_ws_url(origin)
+  uri = URI(origin)
+  uri.scheme = (uri.scheme == 'https') ? 'wss' : 'ws'
+  uri.to_s
+end
+
+BACKEND_HTTP = ENV.fetch('BACKEND_HTTP', URI.join(APP_BACKEND_ORIGIN, 'api/chat').to_s)
+BACKEND_WS   = ENV.fetch('BACKEND_WS', to_ws_url(APP_BACKEND_ORIGIN))
 
 DISCORD_PUBLIC_KEY = ENV['DISCORD_PUBLIC_KEY']
 DISCORD_APP_ID     = ENV['DISCORD_APP_ID']
 DISCORD_TOKEN      = ENV['DISCORD_TOKEN']
 
 get '/' do
-  erb :index
+  erb :index, locals: { backend_http: BACKEND_HTTP, backend_ws: BACKEND_WS, app_env: ENV.fetch('APP_ENV', 'development') }
 end
 
 # Discord HTTP Interactions entrypoint for Cloud Run
@@ -57,6 +71,65 @@ post '/interactions' do
   status 200
   content_type :json
   JSON.generate({ type: 5 })
+end
+
+# ブラウザからはHTTPS同一オリジンでSSEに接続し、バックエンド(HTTP/WS)の結果を中継する
+get '/stream' do
+  content_type 'text/event-stream'
+  headers 'Cache-Control' => 'no-cache', 'X-Accel-Buffering' => 'no'
+
+  prompt = params['prompt'].to_s
+
+  stream do |out|
+    begin
+      session_id = create_session
+      ws = WebSocket::Client::Simple.connect(BACKEND_WS)
+
+      sent_message = false
+
+      ws.on(:open) do
+        ws.send({ type: 'init', sessionId: session_id }.to_json)
+      end
+
+      ws.on(:message) do |evt|
+        msg = JSON.parse(evt.data) rescue nil
+        next unless msg
+        case msg['type']
+        when 'ready'
+          unless sent_message
+            ws.send({ type: 'message', content: prompt }.to_json)
+            sent_message = true
+          end
+        when 'stream_chunk'
+          if msg.dig('data', 'type') == 'content'
+            out << "data: #{msg.dig('data', 'data')}\n\n"
+          end
+        when 'stream_end'
+          out << "event: end\ndata: done\n\n"
+          out.close
+          ws.close
+        when 'error'
+          out << "event: error\ndata: #{msg['error']}\n\n"
+          out.close
+          ws.close
+        end
+      end
+
+      # タイムアウト保護
+      Thread.new do
+        sleep 30
+        begin
+          out << "event: end\ndata: timeout\n\n"
+          out.close
+          ws.close
+        rescue
+        end
+      end
+    rescue => e
+      out << "event: error\ndata: #{e.message}\n\n"
+      out.close
+    end
+  end
 end
 
 helpers do
