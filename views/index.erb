@@ -53,7 +53,7 @@
   
         async function createSession() {  
             try {  
-                const response = await fetch('http://localhost:3000/api/chat', { method: 'POST' });  
+                const response = await fetch('http://34.172.102.142:3000/api/chat', { method: 'POST' });  
                 const data = await response.json();  
                 sessionId = data.sessionId;  
                   
@@ -65,7 +65,7 @@
         }  
   
         function connectWebSocket() {  
-            ws = new WebSocket(`ws://localhost:3000`);  
+            ws = new WebSocket(`ws://34.172.102.142:3000/`);  
               
             ws.onopen = () => {  
                 ws.send(JSON.stringify({ type: 'init', sessionId }));  
