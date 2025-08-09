@@ -3,6 +3,7 @@ source 'https://rubygems.org'
 # Web + utilities
 gem 'sinatra'
 gem 'sinatra-contrib'
+gem 'sinatra-websocket'
 # sinatra-reloader は開発時のみ
 
 gem "rackup", "~> 2.2"

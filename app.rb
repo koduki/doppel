@@ -1,6 +1,7 @@
 require 'sinatra'
 require 'sinatra/json'
 require 'sinatra/reloader' if development?
+require 'sinatra-websocket'
 require 'ed25519'
 require 'base64'
 require 'json'
@@ -11,6 +12,7 @@ require 'logger'
 
 set :port, ENV.fetch('PORT', '8080').to_i
 set :bind, '0.0.0.0'
+set :sockets, []
 
 # Host Authorization を無効化（Cloud Runのrun.appドメインを許可するため）
 configure do
@@ -18,7 +20,7 @@ configure do
   enable :logging
   
   # Rack::Loggerを使用してロガーを設定（Rack 3.2でdeprecated予定のため将来見直し）
-  use Rack::Logger
+  use Rack::CommonLogger
   
   # LOG_LEVEL=DEBUG の場合のみ詳細ログ（存在しない場合はtrueでアクセスログのみ）
   set :logging, true
