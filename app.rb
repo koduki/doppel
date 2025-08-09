@@ -84,22 +84,23 @@ post '/interactions' do
   if itype == 2
     token  = payload['token']
     app_id = DISCORD_APP_ID
-
-    # まずはACK（3秒以内に即返す）
-    content_type :json
+  
     Thread.new do
       begin
         user_prompt   = extract_prompt(payload)
         response_text = fetch_response_via_backend(user_prompt)
         edit_original_response(token, app_id, response_text)
+
+        # sleep 5  # ← ここで待つのはOK（ACKはもう返している）
+        # edit_original_response(token, app_id, "pong! ✅ (no backend)")
       rescue => e
-        logger.error "[INT] worker error: #{e.class}: #{e.message}"
-        edit_original_response(token, app_id, "エラー: #{e.message}")
+        logger.error "[INT] edit error: #{e.class}: #{e.message}"
       end
     end
-
-    # エフェメラルにしたいなら flags: 64 を付ける
-    return JSON.dump(type: 5)  # or JSON.dump(type: 5, data: { flags: 64 })
+  
+    content_type :json
+    logger.info "[INT] defer sent" 
+    return JSON.dump(type: 5)  # ACKだけ即返す（3秒以内）
   end
 
   # それ以外（ボタン等）は未対応なら204
@@ -188,6 +189,8 @@ helpers do
   end
 
   def extract_prompt(interaction)
+    logger.info "[INT] payload: #{interaction}"
+
     # スラッシュコマンドのオプションやメッセージ内容からテキストを抽出
     if interaction['data'] && interaction['data']['options']&.any?
       first = interaction['data']['options'].first
@@ -385,13 +388,24 @@ helpers do
   end
 
   def edit_original_response(token, app_id, content)
-    uri = URI("https://discord.com/api/v10/webhooks/#{app_id}/#{token}/messages/@original")
+    uri  = URI("https://discord.com/api/v10/webhooks/#{app_id}/#{token}/messages/@original")
     http = Net::HTTP.new(uri.host, uri.port); http.use_ssl = true
+    http.open_timeout = 5; http.read_timeout = 10
+  
     req = Net::HTTP::Patch.new(uri.request_uri, { 'Content-Type' => 'application/json' })
     req.body = { content: content }.to_json
-    res = http.request(req)
-    logger.info "[INT] edit original: #{res.code} #{res.body}"
-    res.is_a?(Net::HTTPSuccess)
+  
+    3.times do |i|
+      res = http.request(req)
+      logger.info "[INT] edit original: #{res.code} #{res.body}"
+      return true if res.is_a?(Net::HTTPSuccess)
+      if res.code == '429'
+        sleep((res['Retry-After'] || 0.5).to_f)
+        next
+      end
+      break
+    end
+    false
   end
 
 end
