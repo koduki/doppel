@@ -61,3 +61,8 @@ The web interface will be available at `http://localhost:8080`.
 *   **Web UI Streaming:** The `/stream` endpoint uses Server-Sent Events (SSE) to push data from the backend to the browser.
 *   **Discord Bot:** The `discorb` gem connects to the Discord Gateway API to receive and respond to messages in real-time.
 *   **Backend Communication:** The application communicates with its backend, [gemini-cli-proxy](https://github.com/koduki/gemini-cli-proxy). It creates a session via a POST request and then establishes a WebSocket connection for streaming the chat conversation.
+
+## License
+
+This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+
