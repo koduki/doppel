@@ -391,7 +391,8 @@ if DISCORD_TOKEN && !DISCORD_TOKEN.empty?
   intents = Discorb::Intents.new(
     guilds: true,          # サーバー情報の取得に必要
     messages: true,        # サーバー/DMでのメッセージ受信に必要
-    message_content: true  # メッセージ内容の取得に必要 (特権)
+    message_content: true, # メッセージ内容の取得に必要 (特権)
+    members: true          # サーバーメンバー情報の取得に必要 (特権)
   )
 
   CLIENT = Discorb::Client.new(intents: intents)
@@ -404,8 +405,8 @@ if DISCORD_TOKEN && !DISCORD_TOKEN.empty?
 
   # 受けテキストをチャットAPIにストリーム連携→Discord側に段階編集で反映
   def stream_reply_via_backend_dsc(message, text, timeout: DISCORD_WAIT_TIMEOUT_SEC, logger:)
-    # プレースホルダ送信（ここを随時 edit）
-    msg = message.channel.post("…")
+    # プレースホルダを送信し、完了を待ってメッセージオブジェクトを取得
+    msg = message.channel.post("…").wait
     buffer = +""
     last_edit = Time.now
 
@@ -418,12 +419,13 @@ if DISCORD_TOKEN && !DISCORD_TOKEN.empty?
         # レート制限対策：1秒おき or 200文字ごとに控えめに編集
         if (Time.now - last_edit) >= 1 || buffer.length >= 200
           begin
-            msg.edit(buffer)
+            # 元チャンネル経由でメッセージを編集
+            message.channel.edit_message(msg, buffer).wait
           rescue => e
             logger.warn "[GW] edit failed: #{e.class}: #{e.message}"
             # もし edit が失敗したら控えめに追記投稿（最小限のフォールバック）
             begin
-              msg = message.channel.post(buffer)
+              msg = message.channel.post(buffer).wait
             rescue => e2
               logger.error "[GW] post fallback failed: #{e2.class}: #{e2.message}"
             end
@@ -434,17 +436,20 @@ if DISCORD_TOKEN && !DISCORD_TOKEN.empty?
       },
       on_end: -> {
         begin
-          msg.edit(buffer.empty? ? "(empty)" : buffer)
+          # 元チャンネル経由で最終編集
+          final_content = buffer.empty? ? "(empty)" : buffer
+          message.channel.edit_message(msg, final_content).wait
         rescue => e
           logger.warn "[GW] final edit failed: #{e.class}: #{e.message}"
-          message.channel.post(buffer.empty? ? "(empty)" : buffer) rescue nil
+          message.channel.post(buffer.empty? ? "(empty)" : buffer).wait rescue nil
         end
       },
       on_error: ->(err) {
         begin
-          msg.edit("エラー: #{err}")
+          # 元チャンネル経由でエラーメッセージを編集
+          message.channel.edit_message(msg, "エラー: #{err}").wait
         rescue
-          message.channel.post("エラー: #{err}") rescue nil
+          message.channel.post("エラー: #{err}").wait rescue nil
         end
       }
     )
@@ -460,16 +465,8 @@ if DISCORD_TOKEN && !DISCORD_TOKEN.empty?
       next if message.author.bot?
       is_dm = message.channel.is_a?(Discorb::DMChannel)
       
-      # サーバーでのメンションかDMかを判定
-      mentioned = false
-      unless is_dm
-        # `mentions` がないため `mentioned_users` を試す
-        if message.respond_to?(:mentioned_users)
-          mentioned = message.mentioned_users.any? { |u| u.id == CLIENT.user.id }
-        elsif message.respond_to?(:mentions) # 古いバージョンのためのフォールバック
-          mentioned = message.mentions.any? { |u| u.id == CLIENT.user.id }
-        end
-      end
+      # ライブラリの自動解析に頼らず、メッセージ本文にBotへのメンションが含まれるかを手動で確認
+      mentioned = !!(message.content =~ /<@!?#{CLIENT.user.id}>/)
 
       APP_LOGGER.info "[GW] message received: author=#{message.author.name}, dm=#{is_dm}, mentioned=#{mentioned}, content=#{message.content.inspect}"
       next unless is_dm || mentioned
@@ -479,8 +476,8 @@ if DISCORD_TOKEN && !DISCORD_TOKEN.empty?
 
       stream_reply_via_backend_dsc(message, text, logger: APP_LOGGER)
     rescue => e
-      APP_LOGGER.error "[GW] handler error: #{e.class}: #{e.message}"
-      message.channel.post("ごめん、内部エラー: #{e.message}") rescue nil
+      APP_LOGGER.error "[GW] handler error: #{e.class}: #{e.message}\n#{e.backtrace&.join("\n")}"
+      message.channel.post("ごめん、内部エラー: #{e.message}").wait rescue nil
     end
   end
 
