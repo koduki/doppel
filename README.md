@@ -50,7 +50,7 @@ This application is designed to work with [koduki/gemini-cli-proxy](https://gith
 To start the application, run the following command:
 
 ```bash
-docker-compose up
+docker compose watch
 ```
 
 The web interface will be available at `http://localhost:8080`.

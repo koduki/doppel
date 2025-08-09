@@ -46,7 +46,7 @@ configure do
 end
 
 # --- Helper to add to history ---
-def add_to_history(message)
+def add_to_history(settings, message)
   # Only store user messages and final AI messages for cleaner history
   if message[:type] == 'user_message' || message[:type] == 'ai_end'
     settings.message_history << message
@@ -91,37 +91,39 @@ get '/' do
 end
 
 # --- Core Logic ---
-def broadcast(type, payload)
+def broadcast(settings, type, payload)
   message = { type: type, payload: payload }
   json_message = message.to_json
   
-  add_to_history(message)
+  add_to_history(settings, message)
   
   APP_LOGGER.info("[BROADCAST] #{json_message}")
   settings.sockets.each { |s| s.send(json_message) }
 end
 
-def handle_message(type, payload)
+def handle_message(type, payload, discord_message = nil)
   case type
   when 'user_message'
     message_id = payload['id'] || SecureRandom.uuid
     full_payload = payload.merge('id' => message_id)
-    broadcast('user_message', full_payload)
+    broadcast(settings, 'user_message', full_payload)
 
     if payload['source'] == 'web' && CLIENT && DISCORD_CHANNEL_ID
       channel = CLIENT.fetch_channel(DISCORD_CHANNEL_ID).wait
       channel&.post("#{payload['author']}: #{payload['text']}")
     end
 
-    start_backend_stream(payload['text'], message_id)
+    start_backend_stream(payload['text'], message_id, discord_message)
   else
     APP_LOGGER.warn("[HANDLER] Unknown message type: #{type}")
   end
 end
 
-def start_backend_stream(prompt, message_id)
+def start_backend_stream(prompt, message_id, discord_message = nil)
   session_id = create_session
   return unless session_id
+
+  captured_settings = settings # Capture settings
 
   ws = WebSocket::Client::Simple.connect(BACKEND_WS)
   APP_LOGGER.info("[BACKEND] WS connecting to #{BACKEND_WS} for session #{session_id}")
@@ -144,21 +146,49 @@ def start_backend_stream(prompt, message_id)
         chunk = msg.dig('data', 'data')
         if chunk && !chunk.empty?
           full_ai_response << chunk
-          broadcast('ai_chunk', { 'id' => message_id, 'text' => chunk })
+          broadcast(captured_settings, 'ai_chunk', { 'id' => message_id, 'text' => chunk })
         end
       end
     when 'stream_end'
-      broadcast('ai_end', { 'id' => message_id, 'text' => full_ai_response })
+      broadcast(captured_settings, 'ai_end', { 'id' => message_id, 'text' => full_ai_response })
+      
+      # If the response is not empty, post it to Discord
+      if full_ai_response && !full_ai_response.empty?
+        post_to_discord = nil
+        
+        if discord_message
+          # If it's a reply to a Discord message, post to the same channel
+          post_to_discord = ->(chunk) { discord_message.channel.post(chunk).wait }
+          APP_LOGGER.info("[DISCORD] Replying to Discord message #{discord_message.id}")
+        elsif CLIENT && DISCORD_CHANNEL_ID
+          # Otherwise, if it's from the web, post to the designated channel
+          channel = CLIENT.fetch_channel(DISCORD_CHANNEL_ID).wait
+          if channel
+            post_to_discord = ->(chunk) { channel.post(chunk).wait }
+            APP_LOGGER.info("[DISCORD] Posting Web response to channel #{DISCORD_CHANNEL_ID}")
+          else
+            APP_LOGGER.warn("[DISCORD] Could not find channel with ID #{DISCORD_CHANNEL_ID}")
+          end
+        end
+
+        if post_to_discord
+          # Split into multiple messages if too long
+          full_ai_response.scan(/.{1,2000}/m).each do |chunk|
+            post_to_discord.call(chunk)
+          end
+        end
+      end
+      
       ws.close
     when 'error'
-      broadcast('error', { 'id' => message_id, 'message' => msg['error'] })
+      broadcast(captured_settings, 'error', { 'id' => message_id, 'message' => msg['error'] })
       ws.close
     end
   end
 
   ws.on :error do |e|
     APP_LOGGER.error("[BACKEND] WS error: #{e}")
-    broadcast('error', { 'id' => message_id, 'message' => 'Backend WebSocket connection error' })
+    broadcast(captured_settings, 'error', { 'id' => message_id, 'message' => 'Backend WebSocket connection error' })
   end
 end
 
@@ -234,7 +264,7 @@ if DISCORD_TOKEN && !DISCORD_TOKEN.empty?
       'source' => 'discord',
       'author' => message.author.name,
       'text' => message.content
-    })
+    }, message)
   end
 
   Thread.new do
