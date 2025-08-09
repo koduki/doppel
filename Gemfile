@@ -3,11 +3,11 @@ source 'https://rubygems.org'
 # Web + utilities
 gem 'sinatra'
 gem 'sinatra-contrib'
-gem 'sinatra-websocket'
+gem 'puma'
+gem 'faye-websocket'
 # sinatra-reloader は開発時のみ
 
 gem "rackup", "~> 2.2"
-gem "puma", "~> 6.6"
 
 # Discord HTTP Interactions 署名検証（Ed25519）
 gem 'ed25519'

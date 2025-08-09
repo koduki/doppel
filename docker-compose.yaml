@@ -4,14 +4,14 @@ services:
     build: .
     ports:
       - "8080:8080"
-    volumes:
-      - .:/usr/src/app
-      - bundle_data:/usr/local/bundle
+    develop:
+      watch:
+        - path: .
+          target: /usr/src/app
+          action: sync
+          ignore:
+            - Gemfile.lock
     env_file:
       - .env
     environment:
       - PORT=8080
-    command: ["bundle", "exec", "ruby", "app.rb", "-o", "0.0.0.0"]
-
-volumes:
-  bundle_data:

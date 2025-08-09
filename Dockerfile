@@ -19,16 +19,18 @@ RUN apk add --no-cache tzdata ca-certificates libstdc++
 RUN apk add --no-cache --virtual .build-deps build-base ruby-dev
 
 # 依存インストール
-COPY Gemfile ./
-RUN bundle config set --local without 'thin' && \
+# Copy Gemfile and Gemfile.lock
+COPY Gemfile* ./
+
+# Force re-installation by removing Gemfile.lock and then bundling
+RUN rm -f Gemfile.lock && \
+    echo "Forcing gem re-installation from Gemfile" && \
     bundle install --jobs 4 --retry 3
+
 RUN apk del .build-deps
 
 # アプリ本体
 COPY . .
-
-# ここを追加：最終チェック。不足があれば一時的にビルド依存を入れて再インストール
-RUN bundle check || (apk add --no-cache --virtual .build-deps build-base ruby-dev && bundle install --jobs 4 --retry 3 && apk del .build-deps)
 
 # 非rootで実行
 RUN adduser -D -h /usr/src/app app && chown -R app:app /usr/src/app /usr/local/bundle
@@ -38,4 +40,4 @@ USER app
 EXPOSE 8080
 
 # The command to run the application
-CMD ["bundle", "exec", "ruby", "app.rb", "-o", "0.0.0.0"]
+CMD ["bundle", "exec", "rackup", "-p", "8080"]
