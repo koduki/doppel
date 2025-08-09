@@ -58,8 +58,6 @@ end
 BACKEND_HTTP = ENV.fetch('BACKEND_HTTP', URI.join(APP_BACKEND_ORIGIN, 'api/chat').to_s)
 BACKEND_WS   = ENV.fetch('BACKEND_WS', to_ws_url(APP_BACKEND_ORIGIN))
 
-DISCORD_PUBLIC_KEY = ENV['DISCORD_PUBLIC_KEY']
-DISCORD_APP_ID     = ENV['DISCORD_APP_ID']
 DISCORD_TOKEN      = ENV['DISCORD_TOKEN']
 
 # 定数定義後にバックエンド設定をログ出力
@@ -148,32 +146,6 @@ error do
 end
 
 # --- Helper methods (moved to top-level for global access) ---
-
-def valid_discord_signature?(timestamp, body, signature)
-  return false if DISCORD_PUBLIC_KEY.to_s.strip.empty?
-  return false if timestamp.to_s.empty? || signature.to_s.empty? || body.nil?
-
-  verify_key = Ed25519::VerifyKey.new([DISCORD_PUBLIC_KEY].pack('H*'))
-  verify_key.verify([signature].pack('H*'), timestamp + body)
-  true
-rescue Ed25519::VerifyError, ArgumentError => e
-  APP_LOGGER.warn "[INT] verify failed: #{e.class}: #{e.message}"
-  false
-end
-
-def extract_prompt(interaction)
-  APP_LOGGER.info "[INT] payload: #{interaction}"
-
-  # スラッシュコマンドのオプションやメッセージ内容からテキストを抽出
-  if interaction['data'] && interaction['data']['options']&.any?
-    first = interaction['data']['options'].first
-    first['value'].to_s
-  elsif interaction['data'] && interaction['data']['name']
-    interaction['data']['name'].to_s
-  else
-    'こんにちは'
-  end
-end
 
 # 共通化: バックエンド(HTTP/WS)と会話ストリームを開始し、与えられたコールバックで処理する
 def start_backend_stream(prompt, timeout_sec:, app_logger:, on_chunk:, on_end:, on_error:)
@@ -297,41 +269,6 @@ def start_backend_stream(prompt, timeout_sec:, app_logger:, on_chunk:, on_end:, 
   { ws: ws, timeout_thread: timeout_thread }
 end
 
-def fetch_response_via_backend(prompt)
-  APP_LOGGER.info('[DISCORD] fetch_response_via_backend start')
-
-  collected = String.new
-  mutex = Mutex.new
-  cond = ConditionVariable.new
-  done = false
-
-  controller = start_backend_stream(
-    prompt,
-    timeout_sec: DISCORD_WAIT_TIMEOUT_SEC,
-    app_logger: APP_LOGGER,
-    on_chunk: ->(chunk) {
-      APP_LOGGER.info("[DISCORD] chunk content: #{chunk.to_s.inspect[0..100]}")
-      collected << chunk.to_s
-    },
-    on_end: -> {
-      APP_LOGGER.info("[DISCORD] stream_end received, collected: #{collected.length} chars")
-      mutex.synchronize { done = true; cond.signal }
-    },
-    on_error: ->(err) {
-      APP_LOGGER.error("[DISCORD] error: #{err}")
-      collected << "\n[Error] #{err}"
-      mutex.synchronize { done = true; cond.signal }
-    }
-  )
-
-  mutex.synchronize { cond.wait(mutex) unless done }
-
-  controller[:timeout_thread]&.kill
-  controller[:ws]&.close
-
-  collected.empty? ? '応答がありませんでした。' : collected
-end
-
 def create_session
   uri = URI.parse(BACKEND_HTTP)
   APP_LOGGER.info("[create_session] Connecting to #{uri}")
@@ -360,30 +297,8 @@ def create_session
   sid
 end
 
-def edit_original_response(token, app_id, content)
-  uri  = URI("https://discord.com/api/v10/webhooks/#{app_id}/#{token}/messages/@original")
-  http = Net::HTTP.new(uri.host, uri.port); http.use_ssl = true
-  http.open_timeout = 5; http.read_timeout = 10
-
-  req = Net::HTTP::Patch.new(uri.request_uri, { 'Content-Type' => 'application/json' })
-  req.body = { content: content }.to_json
-
-  3.times do |i|
-    res = http.request(req)
-    APP_LOGGER.info "[INT] edit original: #{res.code} #{res.body}"
-    return true if res.is_a?(Net::HTTPSuccess)
-    if res.code == '429'
-      sleep((res['Retry-After'] || 0.5).to_f)
-      next
-    end
-    break
-  end
-  false
-end
-
 
 # --- Discord Gateway (discorb) を同居起動 ---------------------------------
-# Gemfile に `gem 'discorb'` を追加して bundle install 済みを想定
 if DISCORD_TOKEN && !DISCORD_TOKEN.empty?
   require "discorb"
 
