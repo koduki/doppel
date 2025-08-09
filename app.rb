@@ -108,166 +108,47 @@ get '/stream' do
 
   stream(:keep_open) do |out|
     begin
-      # まず初期イベントを送ってヘッダをフラッシュ（SSE接続確立を確認）
-      out << "retry: 10000\n\n"  # 再接続を10秒に設定
-      out << ":connected\n\n"  # コメント行で接続確認
+      # 初期イベント送信
+      out << "retry: 10000\n\n"
+      out << ":connected\n\n"
       logger.info("[SSE] Initial headers sent")
 
-      session_id = create_session
-      logger.info("[SSE] session created id=#{session_id}")
-      ws = WebSocket::Client::Simple.connect(BACKEND_WS)
-      logger.info("[SSE] WS connecting to #{BACKEND_WS}")
-
-      # SinatraのloggerヘルパーはWSコールバック内では参照できないため束縛
-      app_logger = logger
-
-      # 終了制御
-      finished = false
       state_mutex = Mutex.new
-      timeout_thread = nil
-      chunk_count = 0  # デバッグ用カウンター
+      chunk_count = 0
 
-      sent_message = false
-
-      ws.on(:open) do
-        app_logger.info('[WS] open')
-        ws.send({ type: 'init', sessionId: session_id }.to_json)
-      end
-
-      ws.on(:error) do |e|
-        state_mutex.synchronize do
-          if finished
-            app_logger.debug("[WS] error after finished: #{e}")
-          else
-            app_logger.error("[WS] error #{e}")
-          end
-        end
-      end
-
-      ws.on(:close) do |e|
-        state_mutex.synchronize do
-          if finished
-            app_logger.debug("[WS] close after finished #{e}")
-          else
-            app_logger.info("[WS] close #{e}")
-          end
-        end
-      end
-
-      ws.on(:message) do |evt|
-        app_logger.info("[WS] message raw=#{evt.data}")  # debugからinfoに変更
-        msg = JSON.parse(evt.data) rescue nil
-        unless msg
-          app_logger.warn('[WS] non-JSON message ignored')
-          next
-        end
-        app_logger.info("[WS] message type=#{msg['type']}")  # タイプを明示的にログ
-        case msg['type']
-        when 'ready'
-          app_logger.info('[WS] ready received')
-          unless sent_message
-            ws.send({ type: 'message', content: prompt }.to_json)
-            sent_message = true
-            app_logger.info("[WS] message sent: #{prompt.inspect}")
-          end
-        when 'stream_chunk'
-          app_logger.info("[WS] stream_chunk received")  # debugからinfoに変更
-          if msg.dig('data', 'type') == 'content'
-            chunk = msg.dig('data', 'data')
-            if chunk && !chunk.empty?
-              state_mutex.synchronize do
-                unless finished || out.closed?
-                  chunk_count += 1
-                  app_logger.info("[SSE] Sending chunk ##{chunk_count}: #{chunk.inspect[0..100]}")  # debugからinfoに変更
-                  out << "data: #{chunk}\n\n"
-                  out.flush if out.respond_to?(:flush)  # 明示的にフラッシュ
-                end
-              end
-            else
-              app_logger.info("[WS] Empty chunk ignored")  # debugからinfoに変更
-            end
-          else
-            app_logger.info("[WS] stream_chunk but not content type: #{msg.dig('data', 'type')}")  # 他のタイプのログ
-          end
-        when 'stream_end'
-          should_close = false
+      start_backend_stream(
+        prompt,
+        timeout_sec: SSE_TIMEOUT_SEC,
+        app_logger: logger,
+        on_chunk: ->(chunk) {
           state_mutex.synchronize do
-            unless finished
-              finished = true
-              should_close = true
-            end
-          end
-          if should_close
-            app_logger.info("[WS] stream_end - Total chunks sent: #{chunk_count}")
-            out << "event: end\ndata: done\n\n" unless out.closed?
-            out.close unless out.closed?
-            timeout_thread&.kill
-            ws.close
-          end
-        when 'tool_result'
-          # ツール実行結果（参考コードから）
-          app_logger.info("[WS] tool_result: #{msg['data'].inspect}")
-          state_mutex.synchronize do
-            unless finished || out.closed?
-              tool_info = msg.dig('data', 'toolName') || 'Tool'
-              result = msg.dig('data', 'result') || 'Completed'
-              out << "data: [#{tool_info}]: #{result}\n\n"
+            unless out.closed?
+              chunk_count += 1
+              logger.info("[SSE] Sending chunk ##{chunk_count}: #{chunk.inspect[0..100]}")
+              out << "data: #{chunk}\n\n"
               out.flush if out.respond_to?(:flush)
             end
           end
-        when 'tool_error'
-          # ツールエラー（参考コードから）
-          app_logger.info("[WS] tool_error: #{msg['data'].inspect}")
+        },
+        on_end: -> {
           state_mutex.synchronize do
-            unless finished || out.closed?
-              tool_info = msg.dig('data', 'toolName') || 'Tool'
-              error = msg.dig('data', 'error') || 'Error'
-              out << "data: [Tool Error - #{tool_info}]: #{error}\n\n"
-              out.flush if out.respond_to?(:flush)
+            unless out.closed?
+              logger.info("[WS] stream_end - Total chunks sent: #{chunk_count}")
+              out << "event: end\ndata: done\n\n"
+              out.close
             end
           end
-        when 'error'
-          err = msg['error']
-          should_close = false
+        },
+        on_error: ->(err) {
           state_mutex.synchronize do
-            unless finished
-              finished = true
-              should_close = true
+            unless out.closed?
+              logger.error("[WS] backend error: #{err}")
+              out << "event: backend_error\ndata: #{err}\n\n"
+              out.close
             end
           end
-          if should_close
-            app_logger.error("[WS] backend error: #{err}")
-            out << "event: backend_error\ndata: #{err}\n\n" unless out.closed?
-            out.close unless out.closed?
-            timeout_thread&.kill
-            ws.close
-          end
-        else
-          app_logger.info("[WS] unknown message type=#{msg['type']}, data=#{msg['data'].inspect}")  # debugからinfoに変更
-        end
-      end
-
-      # タイムアウト保護（環境変数で調整可能）
-      timeout_thread = Thread.new do
-        sleep SSE_TIMEOUT_SEC
-        should_close = false
-        state_mutex.synchronize do
-          unless finished
-            finished = true
-            should_close = true
-          end
-        end
-        if should_close
-          begin
-            app_logger.error("[SSE] timeout #{SSE_TIMEOUT_SEC}s reached (session_id=#{session_id}, prompt=#{prompt.inspect}, chunks_sent=#{chunk_count})")
-            out << "event: error\ndata: timeout\n\n" unless out.closed?
-            out.close unless out.closed?
-            ws.close
-          rescue => te
-            app_logger.error("[SSE] timeout cleanup error: #{te}")
-          end
-        end
-      end
+        }
+      )
     rescue => e
       logger.error("[SSE] exception: #{e.class}: #{e.message}\n#{e.backtrace&.join("\n")}")
       out << "event: error\ndata: #{e.message}\n\n" unless out.closed?
@@ -310,69 +191,159 @@ helpers do
     end
   end
 
-  def fetch_response_via_backend(prompt)
-    logger.info("[DISCORD] fetch_response_via_backend start")
-    # 1) セッション作成 (HTTP)
+  # 共通化: バックエンド(HTTP/WS)と会話ストリームを開始し、与えられたコールバックで処理する
+  def start_backend_stream(prompt, timeout_sec:, app_logger:, on_chunk:, on_end:, on_error:)
     session_id = create_session
-    logger.info("[DISCORD] session id=#{session_id}")
+    app_logger.info("[BACKEND] session created id=#{session_id}")
 
-    # 2) WS接続してストリーミングを受信
-    collected = String.new
     ws = WebSocket::Client::Simple.connect(BACKEND_WS)
-    logger.info("[DISCORD] WS connect to #{BACKEND_WS}")
+    app_logger.info("[BACKEND] WS connecting to #{BACKEND_WS}")
 
-    ready = false
-    mutex = Mutex.new
-    cond = ConditionVariable.new
-
-    # SinatraのloggerヘルパーはWSコールバック内では参照できないため束縛
-    app_logger = logger
+    state_mutex = Mutex.new
+    finished = false
+    sent_message = false
 
     ws.on(:open) do
-      app_logger.info('[DISCORD] WS open')
+      app_logger.info('[WS] open')
       ws.send({ type: 'init', sessionId: session_id }.to_json)
     end
 
-    ws.on(:message) do |evt|
-      app_logger.info("[DISCORD] message raw=#{evt.data}")  # debugからinfoに変更
-      msg = JSON.parse(evt.data) rescue nil
-      next unless msg
-      app_logger.info("[DISCORD] message type=#{msg['type']}")  # タイプを明示的にログ
-      case msg['type']
-      when 'ready'
-        ready = true
-        ws.send({ type: 'message', content: prompt }.to_json)
-        app_logger.info("[DISCORD] message sent: #{prompt.inspect}")
-      when 'stream_chunk'
-        app_logger.info("[DISCORD] stream_chunk received")
-        if msg.dig('data', 'type') == 'content'
-          chunk_data = msg.dig('data', 'data').to_s
-          app_logger.info("[DISCORD] chunk content: #{chunk_data.inspect[0..100]}")
-          collected << chunk_data
-        else
-          app_logger.info("[DISCORD] stream_chunk but not content: #{msg.dig('data', 'type')}")
+    ws.on(:error) do |e|
+      state_mutex.synchronize do
+        unless finished
+          app_logger.error("[WS] error #{e}")
         end
-      when 'stream_end'
-        app_logger.info("[DISCORD] stream_end received, collected: #{collected.length} chars")
-        mutex.synchronize { cond.signal }
-      when 'error'
-        app_logger.error("[DISCORD] error: #{msg['error']}")
-        collected << "\n[Error] #{msg['error']}"
-        mutex.synchronize { cond.signal }
-      else
-        app_logger.info("[DISCORD] unknown type: #{msg['type']}")
       end
     end
 
-    # タイムアウト（環境変数で調整可能）
-    Thread.new do
-      sleep DISCORD_WAIT_TIMEOUT_SEC
-      app_logger.error("[DISCORD] timeout #{DISCORD_WAIT_TIMEOUT_SEC}s reached (session_id=#{session_id}, prompt=#{prompt.inspect})")
-      mutex.synchronize { cond.signal }
+    ws.on(:close) do |e|
+      state_mutex.synchronize do
+        if finished
+          app_logger.debug("[WS] close after finished #{e}")
+        else
+          app_logger.info("[WS] close #{e}")
+        end
+      end
     end
 
-    mutex.synchronize { cond.wait(mutex) }
-    ws.close
+    ws.on(:message) do |evt|
+      app_logger.info("[WS] message raw=#{evt.data}")
+      msg = JSON.parse(evt.data) rescue nil
+      unless msg
+        app_logger.warn('[WS] non-JSON message ignored')
+        next
+      end
+      app_logger.info("[WS] message type=#{msg['type']}")
+
+      case msg['type']
+      when 'ready'
+        app_logger.info('[WS] ready received')
+        unless sent_message
+          ws.send({ type: 'message', content: prompt }.to_json)
+          sent_message = true
+          app_logger.info("[WS] message sent: #{prompt.inspect}")
+        end
+      when 'stream_chunk'
+        if msg.dig('data', 'type') == 'content'
+          chunk = msg.dig('data', 'data')
+          if chunk && !chunk.empty?
+            state_mutex.synchronize do
+              unless finished
+                on_chunk.call(chunk)
+              end
+            end
+          else
+            app_logger.info('[WS] Empty chunk ignored')
+          end
+        else
+          app_logger.info("[WS] stream_chunk but not content type: #{msg.dig('data', 'type')}")
+        end
+      when 'stream_end'
+        should_close = false
+        state_mutex.synchronize do
+          unless finished
+            finished = true
+            should_close = true
+          end
+        end
+        if should_close
+          app_logger.info('[WS] stream_end')
+          on_end.call
+          ws.close
+        end
+      when 'error'
+        err = msg['error']
+        should_close = false
+        state_mutex.synchronize do
+          unless finished
+            finished = true
+            should_close = true
+          end
+        end
+        if should_close
+          app_logger.error("[WS] backend error: #{err}")
+          on_error.call(err)
+          ws.close
+        end
+      else
+        app_logger.info("[WS] unknown message type=#{msg['type']}, data=#{msg['data'].inspect}")
+      end
+    end
+
+    timeout_thread = Thread.new do
+      sleep timeout_sec
+      should_close = false
+      state_mutex.synchronize do
+        unless finished
+          finished = true
+          should_close = true
+        end
+      end
+      if should_close
+        begin
+          app_logger.error("[BACKEND] timeout #{timeout_sec}s reached (prompt=#{prompt.inspect})")
+          on_error.call('timeout')
+          ws.close
+        rescue => te
+          app_logger.error("[BACKEND] timeout cleanup error: #{te}")
+        end
+      end
+    end
+
+    { ws: ws, timeout_thread: timeout_thread }
+  end
+
+  def fetch_response_via_backend(prompt)
+    logger.info('[DISCORD] fetch_response_via_backend start')
+
+    collected = String.new
+    mutex = Mutex.new
+    cond = ConditionVariable.new
+    done = false
+
+    controller = start_backend_stream(
+      prompt,
+      timeout_sec: DISCORD_WAIT_TIMEOUT_SEC,
+      app_logger: logger,
+      on_chunk: ->(chunk) {
+        logger.info("[DISCORD] chunk content: #{chunk.to_s.inspect[0..100]}")
+        collected << chunk.to_s
+      },
+      on_end: -> {
+        logger.info("[DISCORD] stream_end received, collected: #{collected.length} chars")
+        mutex.synchronize { done = true; cond.signal }
+      },
+      on_error: ->(err) {
+        logger.error("[DISCORD] error: #{err}")
+        collected << "\n[Error] #{err}"
+        mutex.synchronize { done = true; cond.signal }
+      }
+    )
+
+    mutex.synchronize { cond.wait(mutex) unless done }
+
+    controller[:timeout_thread]&.kill
+    controller[:ws]&.close
 
     collected.empty? ? '応答がありませんでした。' : collected
   end
