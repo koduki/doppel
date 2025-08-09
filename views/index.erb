@@ -50,27 +50,27 @@
     <script>  
         // 同一オリジンのSSEで中継するため、外部HTTP/WSへは直接アクセスしない
         let currentStream = null;
-
+  
         function createSession() {  
             addMessage('System', 'Ready.', 'system-message');  
         }
-
+  
         function sendMessage() {  
             const input = document.getElementById('message-input');  
             const message = input.value.trim();  
             if (!message) return;  
-
+  
             // 前のストリームがあれば閉じる
             if (currentStream) { currentStream.close(); currentStream = null; }
-
+  
             addMessage('You', message, 'user-message');  
             addMessage('Gemini', '', 'ai-message');
-
+  
             // 同一オリジンのSSEに接続
             const url = `/stream?prompt=${encodeURIComponent(message)}`;
             const es = new EventSource(url);
             currentStream = es;
-
+  
             es.onmessage = (e) => {
                 appendToLastMessage(e.data);
             };
@@ -79,11 +79,22 @@
                 currentStream = null;
             });
             es.addEventListener('error', (e) => {
-                addMessage('Error', 'Streaming error.', 'error-message');
+                const state = ['CONNECTING','OPEN','CLOSED'][es.readyState] || es.readyState;
+                addMessage('Error', `Streaming error. state=${state}`, 'error-message');
+                try {
+                  addMessage('Error', `event=${JSON.stringify(e)}`, 'error-message');
+                } catch {}
                 es.close();
                 currentStream = null;
             });
 
+            // サーバ側が送る backend_error イベント
+            es.addEventListener('backend_error', (e) => {
+                if (e.data) {
+                  addMessage('Backend', e.data, 'error-message');
+                }
+            });
+  
             input.value = '';
         }  
   

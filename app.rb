@@ -14,7 +14,20 @@ set :bind, '0.0.0.0'
 # Host Authorization を無効化（Cloud Runのrun.appドメインを許可するため）
 configure do
   disable :protection
+  enable :logging
+  
+  # Rack::Loggerを使用してロガーを設定（Rack 3.2でdeprecated予定のため将来見直し）
+  use Rack::Logger
+  
+  # LOG_LEVEL=DEBUG の場合のみ詳細ログ（存在しない場合はtrueでアクセスログのみ）
+  set :logging, true
 end
+
+# タイムアウト関連の環境変数（デフォルトは既存値を維持）
+SSE_TIMEOUT_SEC = Integer(ENV.fetch('SSE_TIMEOUT_SEC', '30'))
+DISCORD_WAIT_TIMEOUT_SEC = Integer(ENV.fetch('DISCORD_WAIT_TIMEOUT_SEC', '20'))
+HTTP_OPEN_TIMEOUT_SEC = ENV['HTTP_OPEN_TIMEOUT_SEC']&.strip
+HTTP_READ_TIMEOUT_SEC = ENV['HTTP_READ_TIMEOUT_SEC']&.strip
 
 # 接続先を環境変数から指定できるようにする
 APP_BACKEND_ORIGIN = ENV.fetch('APP_BACKEND_ORIGIN', 'http://34.68.145.5/')
@@ -79,57 +92,96 @@ get '/stream' do
   headers 'Cache-Control' => 'no-cache', 'X-Accel-Buffering' => 'no'
 
   prompt = params['prompt'].to_s
+  logger.info("[SSE] /stream start prompt=#{prompt.inspect}")
 
   stream do |out|
     begin
+      # まず初期イベントを送ってヘッダをフラッシュ
+      out << ":ok\n\n"
+
       session_id = create_session
+      logger.info("[SSE] session created id=#{session_id}")
       ws = WebSocket::Client::Simple.connect(BACKEND_WS)
+      logger.info("[SSE] WS connecting to #{BACKEND_WS}")
 
       sent_message = false
 
       ws.on(:open) do
+        logger.info('[WS] open')
         ws.send({ type: 'init', sessionId: session_id }.to_json)
       end
 
+      ws.on(:error) do |e|
+        logger.error("[WS] error #{e}")
+      end
+
+      ws.on(:close) do |e|
+        logger.info("[WS] close #{e}")
+      end
+
       ws.on(:message) do |evt|
+        logger.debug("[WS] message raw=#{evt.data}")
         msg = JSON.parse(evt.data) rescue nil
-        next unless msg
+        unless msg
+          logger.warn('[WS] non-JSON message ignored')
+          next
+        end
         case msg['type']
         when 'ready'
+          logger.info('[WS] ready received')
           unless sent_message
             ws.send({ type: 'message', content: prompt }.to_json)
             sent_message = true
+            logger.info('[WS] message sent')
           end
         when 'stream_chunk'
           if msg.dig('data', 'type') == 'content'
-            out << "data: #{msg.dig('data', 'data')}\n\n"
+            chunk = msg.dig('data', 'data')
+            out << "data: #{chunk}\n\n"
           end
         when 'stream_end'
+          logger.info('[WS] stream_end')
           out << "event: end\ndata: done\n\n"
           out.close
           ws.close
         when 'error'
-          out << "event: error\ndata: #{msg['error']}\n\n"
+          err = msg['error']
+          logger.error("[WS] backend error: #{err}")
+          out << "event: backend_error\ndata: #{err}\n\n"
           out.close
           ws.close
+        else
+          logger.debug("[WS] ignored type=#{msg['type']}")
         end
       end
 
-      # タイムアウト保護
+      # タイムアウト保護（環境変数で調整可能）
       Thread.new do
-        sleep 30
+        sleep SSE_TIMEOUT_SEC
         begin
+          logger.warn("[SSE] timeout #{SSE_TIMEOUT_SEC}s reached")
           out << "event: end\ndata: timeout\n\n"
           out.close
           ws.close
-        rescue
+        rescue => te
+          logger.error("[SSE] timeout cleanup error: #{te}")
         end
       end
     rescue => e
+      logger.error("[SSE] exception: #{e.class}: #{e.message}\n#{e.backtrace&.join("\n")}")
       out << "event: error\ndata: #{e.message}\n\n"
       out.close
     end
   end
+end
+
+# グローバルエラーハンドラ
+error do
+  e = env['sinatra.error']
+  logger.error("[ERROR] #{e.class}: #{e.message}\n#{e.backtrace&.join("\n")}")
+  status 500
+  content_type :json
+  { error: e.message }.to_json
 end
 
 helpers do
@@ -158,22 +210,27 @@ helpers do
   end
 
   def fetch_response_via_backend(prompt)
+    logger.info("[DISCORD] fetch_response_via_backend start")
     # 1) セッション作成 (HTTP)
     session_id = create_session
+    logger.info("[DISCORD] session id=#{session_id}")
 
     # 2) WS接続してストリーミングを受信
     collected = String.new
     ws = WebSocket::Client::Simple.connect(BACKEND_WS)
+    logger.info("[DISCORD] WS connect to #{BACKEND_WS}")
 
     ready = false
     mutex = Mutex.new
     cond = ConditionVariable.new
 
     ws.on(:open) do
+      logger.info('[DISCORD] WS open')
       ws.send({ type: 'init', sessionId: session_id }.to_json)
     end
 
     ws.on(:message) do |evt|
+      logger.debug("[DISCORD] message raw=#{evt.data}")
       msg = JSON.parse(evt.data) rescue nil
       next unless msg
       case msg['type']
@@ -192,9 +249,10 @@ helpers do
       end
     end
 
-    # タイムアウト
+    # タイムアウト（環境変数で調整可能）
     Thread.new do
-      sleep 20
+      sleep DISCORD_WAIT_TIMEOUT_SEC
+      logger.warn("[DISCORD] timeout #{DISCORD_WAIT_TIMEOUT_SEC}s reached")
       mutex.synchronize { cond.signal }
     end
 
@@ -209,13 +267,25 @@ helpers do
     http = Net::HTTP.new(uri.host, uri.port)
     http.use_ssl = uri.scheme == 'https'
 
+    # HTTPの接続/読み込みタイムアウト（環境変数で設定があれば適用）
+    http.open_timeout = Integer(HTTP_OPEN_TIMEOUT_SEC) if HTTP_OPEN_TIMEOUT_SEC && !HTTP_OPEN_TIMEOUT_SEC.empty?
+    http.read_timeout = Integer(HTTP_READ_TIMEOUT_SEC) if HTTP_READ_TIMEOUT_SEC && !HTTP_READ_TIMEOUT_SEC.empty?
+
     req = Net::HTTP::Post.new(uri.request_uri)
     res = http.request(req)
 
-    raise "セッション作成に失敗しました (#{res.code})" unless res.is_a?(Net::HTTPSuccess)
+    unless res.is_a?(Net::HTTPSuccess)
+      logger.error("[BACKEND] session failed code=#{res.code} body=#{res.body}")
+      raise "セッション作成に失敗しました (#{res.code})"
+    end
 
     body = JSON.parse(res.body)
-    body['sessionId'] || raise('sessionId が取得できませんでした')
+    sid = body['sessionId']
+    unless sid
+      logger.error("[BACKEND] session ok but sessionId missing body=#{res.body}")
+      raise 'sessionId が取得できませんでした'
+    end
+    sid
   end
 
   def edit_original_response(token, app_id, content)
