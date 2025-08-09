@@ -65,37 +65,45 @@ end
 post '/interactions' do
   request.body.rewind
   raw_body = request.body.read
-  timestamp = request.env['HTTP_X_SIGNATURE_TIMESTAMP']
-  signature = request.env['HTTP_X_SIGNATURE_ED25519']
+  ts  = request.env['HTTP_X_SIGNATURE_TIMESTAMP']
+  sig = request.env['HTTP_X_SIGNATURE_ED25519']
 
-  halt 401, 'Bad request signature' unless valid_discord_signature?(timestamp, raw_body, signature)
+  logger.info("[INT] ts.len=#{ts&.length} sig.len=#{sig&.length} body.len=#{raw_body.bytesize} pk.len=#{DISCORD_PUBLIC_KEY&.length}")
+  halt 401, 'Bad request signature' unless valid_discord_signature?(ts, raw_body, sig)
 
-  interaction = JSON.parse(raw_body)
+  payload = JSON.parse(raw_body) rescue {}
+  itype = payload['type']
 
   # PING -> PONG
-  if interaction['type'] == 1
+  if itype == 1
     content_type :json
-    return JSON.generate({ type: 1 })
+    return JSON.dump(type: 1)
   end
 
-  # Application Command or Message Component
-  # まずACK (type 5) で遅延レスポンス
-  token = interaction['token']
-  app_id = DISCORD_APP_ID
-  # DiscordはACK(type 5)で遅延レスポンスを期待するため、即時200 with {type:5} を返す
-  Thread.new do
-    begin
-      user_prompt = extract_prompt(interaction)
-      response_text = fetch_response_via_backend(user_prompt)
-      edit_original_response(token, app_id, response_text)
-    rescue => e
-      edit_original_response(token, app_id, "エラーが発生しました: #{e.message}")
+  # スラッシュコマンド（APPLICATION_COMMAND）
+  if itype == 2
+    token  = payload['token']
+    app_id = DISCORD_APP_ID
+
+    # まずはACK（3秒以内に即返す）
+    content_type :json
+    Thread.new do
+      begin
+        user_prompt   = extract_prompt(payload)
+        response_text = fetch_response_via_backend(user_prompt)
+        edit_original_response(token, app_id, response_text)
+      rescue => e
+        logger.error "[INT] worker error: #{e.class}: #{e.message}"
+        edit_original_response(token, app_id, "エラー: #{e.message}")
+      end
     end
+
+    # エフェメラルにしたいなら flags: 64 を付ける
+    return JSON.dump(type: 5)  # or JSON.dump(type: 5, data: { flags: 64 })
   end
 
-  status 200
-  content_type :json
-  JSON.generate({ type: 5 })
+  # それ以外（ボタン等）は未対応なら204
+  status 204
 end
 
 # ブラウザからはHTTPS同一オリジンでSSEに接続し、バックエンド(HTTP/WS)の結果を中継する
@@ -169,14 +177,14 @@ end
 helpers do
   def valid_discord_signature?(timestamp, body, signature)
     return false if DISCORD_PUBLIC_KEY.to_s.strip.empty?
+    return false if timestamp.to_s.empty? || signature.to_s.empty? || body.nil?
+
     verify_key = Ed25519::VerifyKey.new([DISCORD_PUBLIC_KEY].pack('H*'))
-    message = timestamp + body
-    begin
-      verify_key.verify([signature].pack('H*'), message)
-      true
-    rescue Ed25519::VerifyError
-      false
-    end
+    verify_key.verify([signature].pack('H*'), timestamp + body)
+    true
+  rescue Ed25519::VerifyError, ArgumentError => e
+    logger.warn "[INT] verify failed: #{e.class}: #{e.message}"
+    false
   end
 
   def extract_prompt(interaction)
@@ -378,15 +386,12 @@ helpers do
 
   def edit_original_response(token, app_id, content)
     uri = URI("https://discord.com/api/v10/webhooks/#{app_id}/#{token}/messages/@original")
-    http = Net::HTTP.new(uri.host, uri.port)
-    http.use_ssl = true
-
+    http = Net::HTTP.new(uri.host, uri.port); http.use_ssl = true
     req = Net::HTTP::Patch.new(uri.request_uri, { 'Content-Type' => 'application/json' })
     req.body = { content: content }.to_json
     res = http.request(req)
-
-    unless res.is_a?(Net::HTTPSuccess)
-      warn "Discord edit message failed: #{res.code} #{res.body}"
-    end
+    logger.info "[INT] edit original: #{res.code} #{res.body}"
+    res.is_a?(Net::HTTPSuccess)
   end
+
 end
