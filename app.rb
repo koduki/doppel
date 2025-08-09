@@ -16,6 +16,7 @@ set :sockets, []
 set :message_history, []
 set :history_max_size, 50
 set :server, 'puma'
+set :history_mutex, Mutex.new
 
 # --- Logging Setup ---
 configure do
@@ -47,11 +48,15 @@ end
 
 # --- Helper to add to history ---
 def add_to_history(settings, message)
-  # Only store user messages and final AI messages for cleaner history
-  if message[:type] == 'user_message' || message[:type] == 'ai_end'
-    settings.message_history << message
-    if settings.message_history.size > settings.history_max_size
-      settings.message_history.shift
+  # Store all relevant messages for debugging
+  if ['user_message', 'ai_chunk', 'ai_end'].include?(message[:type])
+    settings.history_mutex.synchronize do
+      APP_LOGGER.debug("[HISTORY] Adding to history: #{message.to_json}")
+      settings.message_history << message
+      if settings.message_history.size > settings.history_max_size
+        # To avoid growing indefinitely, trim the history
+        settings.message_history.shift
+      end
     end
   end
 end
@@ -64,8 +69,9 @@ get '/' do
     ws.on :open do |event|
       APP_LOGGER.info("[WS_HUB] WebSocket connection opened")
       settings.sockets << ws
-      # Send history
-      ws.send({ type: 'history', payload: settings.message_history }.to_json)
+      # Send history safely
+      history_payload = settings.history_mutex.synchronize { settings.message_history }
+      ws.send({ type: 'history', payload: history_payload }.to_json)
     end
 
     ws.on :message do |event|
@@ -110,7 +116,18 @@ def handle_message(type, payload, discord_message = nil)
 
     if payload['source'] == 'web' && CLIENT && DISCORD_CHANNEL_ID
       channel = CLIENT.fetch_channel(DISCORD_CHANNEL_ID).wait
-      channel&.post("#{payload['author']}: #{payload['text']}")
+      if channel
+        # title用に空文字列を渡し、他の属性は後から設定します。
+        embed = Discorb::Embed.new("")
+        embed.description = payload['text']
+        embed.color = Discorb::Color.from_hex("#7289da")
+        
+        # AuthorとFooterもキーワード引数なしで生成します。
+        embed.author = Discorb::Embed::Author.new(payload['author'])
+        embed.footer = Discorb::Embed::Footer.new("via Web UI")
+        
+        channel.post(embeds: [embed]).wait
+      end
     end
 
     start_backend_stream(payload['text'], message_id, discord_message)
@@ -150,6 +167,7 @@ def start_backend_stream(prompt, message_id, discord_message = nil)
         end
       end
     when 'stream_end'
+      APP_LOGGER.debug("[BACKEND] Stream ended. Full response: '#{full_ai_response}'")
       broadcast(captured_settings, 'ai_end', { 'id' => message_id, 'text' => full_ai_response })
       
       # If the response is not empty, post it to Discord
