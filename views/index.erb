@@ -48,75 +48,53 @@
     </div>  
   
     <script>  
-        let sessionId = null;  
-        let ws = null;  
+        let currentStream = null;
   
-        async function createSession() {  
-            try {  
-                const response = await fetch('http://localhost:3000/api/chat', { method: 'POST' });  
-                const data = await response.json();  
-                sessionId = data.sessionId;  
-                  
-                connectWebSocket();  
-                addMessage('System', 'Session created successfully.', 'ai-message');  
-            } catch (error) {  
-                addMessage('Error', 'Failed to create session: ' + error.message, 'error-message');  
-            }  
-        }  
-  
-        function connectWebSocket() {  
-            ws = new WebSocket(`ws://localhost:3000`);  
-              
-            ws.onopen = () => {  
-                ws.send(JSON.stringify({ type: 'init', sessionId }));  
-            };  
-  
-            ws.onmessage = (event) => {  
-                const message = JSON.parse(event.data);  
-                handleWebSocketMessage(message);  
-            };  
-  
-            ws.onerror = (error) => {  
-                addMessage('Error', 'WebSocket connection error.', 'error-message');  
-            };  
-        }  
-  
-        function handleWebSocketMessage(message) {  
-            switch (message.type) {  
-                case 'ready':  
-                    addMessage('System', 'WebSocket connection established.', 'system-message');  
-                    break;  
-                case 'stream_chunk':  
-                    if (message.data.type === 'content') {  
-                        appendToLastMessage(message.data.data);  
-                    }  
-                    break;  
-                case 'stream_end':  
-                    // Streaming finished
-                    break;  
-                case 'tool_result':
-                    addMessage('Tool', `${message.data.toolName}: ${message.data.result || 'Completed'}`, 'tool-message');
-                    break;
-                case 'tool_error':
-                    addMessage('Tool Error', `${message.data.toolName}: ${message.data.error}`, 'error-message');
-                    break;
-                case 'error':  
-                    addMessage('Error', message.error, 'error-message');  
-                    break;  
-            }  
-        }  
+        function createSession() {  
+            addMessage('System', 'Ready.', 'system-message');  
+        }
   
         function sendMessage() {  
             const input = document.getElementById('message-input');  
             const message = input.value.trim();  
-              
-            if (!message || !ws) return;  
+            if (!message) return;  
+  
+            // 前のストリームがあれば閉じる
+            if (currentStream) { currentStream.close(); currentStream = null; }
   
             addMessage('You', message, 'user-message');  
-            addMessage('Gemini', '', 'ai-message'); // Prepare an empty AI response
-              
-            ws.send(JSON.stringify({ type: 'message', content: message }));  
-            input.value = '';  
+            addMessage('Gemini', '', 'ai-message');
+  
+            // 同一オリジンのSSEに接続
+            const url = `/stream?prompt=${encodeURIComponent(message)}`;
+            const es = new EventSource(url);
+            currentStream = es;
+  
+            es.onmessage = (e) => {
+                appendToLastMessage(e.data);
+            };
+            es.addEventListener('end', (e) => {
+                es.close();
+                currentStream = null;
+            });
+            es.addEventListener('error', (e) => {
+                const state = ['CONNECTING','OPEN','CLOSED'][es.readyState] || es.readyState;
+                addMessage('Error', `Streaming error. state=${state}`, 'error-message');
+                try {
+                  addMessage('Error', `event=${JSON.stringify(e)}`, 'error-message');
+                } catch {}
+                es.close();
+                currentStream = null;
+            });
+
+            // サーバ側が送る backend_error イベント
+            es.addEventListener('backend_error', (e) => {
+                if (e.data) {
+                  addMessage('Backend', e.data, 'error-message');
+                }
+            });
+  
+            input.value = '';
         }  
   
         function addMessage(sender, content, className) {  
