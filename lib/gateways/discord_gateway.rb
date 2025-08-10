@@ -34,15 +34,17 @@ class DiscordGateway
   def broadcast_user_message(message)
     # Only post to Discord if the message originated from the web
     if message[:payload]['source'] == 'web'
-      channel = get_designated_channel
-      return unless channel
+      Thread.new do
+        channel = get_designated_channel
+        next unless channel
 
-      embed = Discorb::Embed.new("")
-      embed.description = message[:payload]['text']
-      embed.color = Discorb::Color.from_hex("#7289da")
-      embed.author = Discorb::Embed::Author.new(message[:payload]['author'])
-      embed.footer = Discorb::Embed::Footer.new("via Web UI")
-      post_embed(channel, embed)
+        embed = Discorb::Embed.new("")
+        embed.description = message[:payload]['text']
+        embed.color = Discorb::Color.from_hex("#7289da")
+        embed.author = Discorb::Embed::Author.new(message[:payload]['author'])
+        embed.footer = Discorb::Embed::Footer.new("via Web UI")
+        post_embed(channel, embed)
+      end
     end
   end
 
@@ -51,19 +53,21 @@ class DiscordGateway
   end
 
   def broadcast_ai_end(message)
-    # Post the final AI response to the appropriate channel
-    target_channel = if message[:context] && message[:context][:discord_message]
-      message[:context][:discord_message].channel
-    else
-      get_designated_channel
-    end
-    
-    return unless target_channel
-    full_text = message[:payload]['text']
-    return if full_text.nil? || full_text.empty?
+    Thread.new do
+      # Post the final AI response to the appropriate channel
+      target_channel = if message[:context] && message[:context][:discord_message]
+        message[:context][:discord_message].channel
+      else
+        get_designated_channel
+      end
+      
+      next unless target_channel
+      full_text = message[:payload]['text']
+      next if full_text.nil? || full_text.empty?
 
-    full_text.scan(/.{1,2000}/m).each do |chunk|
-      post_message(target_channel, chunk)
+      full_text.scan(/.{1,2000}/m).each do |chunk|
+        post_message(target_channel, chunk)
+      end
     end
   end
 
