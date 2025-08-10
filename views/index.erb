@@ -52,6 +52,10 @@
         const input = document.getElementById('message-input');
         let ws;
 
+        // --- Optimized Rendering Globals ---
+        const updateQueue = new Map();
+        let isUpdateScheduled = false;
+
         function initWebSocket() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const wsUrl = `${protocol}//${window.location.host}/`;
@@ -76,10 +80,11 @@
                         addMessage(data.payload.id + '-ai', 'AI', '', 'ai-message');
                         break;
                     case 'ai_chunk':
-                        appendToLastMessage(data.payload.id + '-ai', data.payload.text);
+                        scheduleUpdate(data.payload.id + '-ai', data.payload.text);
                         break;
                     case 'ai_end':
-                        // Optionally handle the end of an AI message (e.g., remove typing indicator)
+                        // Ensure any remaining text in the queue is flushed
+                        processUpdateQueue();
                         break;
                     case 'error':
                         addMessage(data.payload.id, 'Error', data.payload.message, 'error-message');
@@ -121,10 +126,10 @@
                 const { type, payload } = msg;
                 if (type === 'user_message') {
                     addMessage(payload.id, payload.author, payload.text, 'user-message');
-                    // Assume an AI response followed, create a placeholder
                     addMessage(payload.id + '-ai', 'AI', '', 'ai-message');
                 } else if (type === 'ai_chunk') {
-                    appendToLastMessage(payload.id + '-ai', payload.text);
+                    // In history rendering, append directly without throttling
+                    appendToMessage(payload.id + '-ai', payload.text);
                 }
             });
              addSystemMessage('Chat history loaded.');
@@ -139,7 +144,7 @@
             scrollToBottom();
         }
 
-        function appendToLastMessage(id, content) {
+        function appendToMessage(id, content) {
             const messageDiv = document.getElementById('msg-' + id);
             if (messageDiv) {
                 const contentSpan = messageDiv.querySelector('.content');
@@ -147,6 +152,26 @@
                     contentSpan.textContent += content;
                 }
             }
+        }
+
+        function scheduleUpdate(id, content) {
+            if (!updateQueue.has(id)) {
+                updateQueue.set(id, '');
+            }
+            updateQueue.set(id, updateQueue.get(id) + content);
+
+            if (!isUpdateScheduled) {
+                isUpdateScheduled = true;
+                requestAnimationFrame(processUpdateQueue);
+            }
+        }
+
+        function processUpdateQueue() {
+            updateQueue.forEach((content, id) => {
+                appendToMessage(id, content);
+            });
+            updateQueue.clear();
+            isUpdateScheduled = false;
             scrollToBottom();
         }
         

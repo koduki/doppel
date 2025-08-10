@@ -7,7 +7,7 @@ require 'logger'
 require_relative 'lib/chat_state'
 require_relative 'lib/gateways/web_gateway'
 require_relative 'lib/gateways/discord_gateway'
-require_relative 'lib/services/ai_agent_client'
+require_relative 'lib/services/chat_orchestrator'
 
 # --- Sinatra App Setup ---
 set :port, ENV.fetch('PORT', '8080').to_i
@@ -47,14 +47,17 @@ end
 # --- Component Initialization & Dependency Injection ---
 chat_state = ChatState.new
 
-# To solve circular dependencies (A needs B, B needs A), we use setter injection.
-web_gateway = WebGateway.new(chat_state, nil)
-discord_gateway = DiscordGateway.new(DISCORD_TOKEN, DISCORD_CHANNEL_ID, chat_state, nil)
-ai_client = AIAgentClient.new(BACKEND_WS, BACKEND_HTTP, chat_state, web_gateway, discord_gateway)
+# Gateways are our responders. They listen for events.
+web_gateway = WebGateway.new(chat_state, nil) # ai_client is set later
+discord_gateway = DiscordGateway.new(DISCORD_TOKEN, DISCORD_CHANNEL_ID, chat_state, nil) # ai_client is set later
+responders = [web_gateway, discord_gateway].compact # Use compact to remove nil if discord_gateway isn't configured
 
-# Inject dependencies back into the gateways
-web_gateway.ai_client = ai_client
-discord_gateway.ai_client = ai_client
+# The AI client orchestrates the interaction.
+chat_orchestrator = ChatOrchestrator.new(BACKEND_WS, BACKEND_HTTP, chat_state, responders)
+
+# Inject the orchestrator back into the gateways so they can initiate streams.
+web_gateway.chat_orchestrator = chat_orchestrator
+discord_gateway.chat_orchestrator = chat_orchestrator if discord_gateway
 
 
 # --- Start Services ---

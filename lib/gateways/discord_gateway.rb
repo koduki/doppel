@@ -2,15 +2,15 @@
 require 'discorb'
 
 class DiscordGateway
-  attr_writer :ai_client
+  attr_writer :chat_orchestrator
 
-  def initialize(token, channel_id, chat_state, ai_client)
+  def initialize(token, channel_id, chat_state, chat_orchestrator)
     return unless token && !token.empty?
 
     @token = token
     @channel_id = channel_id
     @chat_state = chat_state
-    @ai_client = ai_client
+    @chat_orchestrator = chat_orchestrator
     
     intents = Discorb::Intents.new(
       guilds: true,
@@ -29,6 +29,58 @@ class DiscordGateway
     end
   end
 
+  # --- Common Gateway Interface ---
+
+  def broadcast_user_message(message)
+    # Only post to Discord if the message originated from the web
+    if message[:payload]['source'] == 'web'
+      channel = get_designated_channel
+      return unless channel
+
+      embed = Discorb::Embed.new("")
+      embed.description = message[:payload]['text']
+      embed.color = Discorb::Color.from_hex("#7289da")
+      embed.author = Discorb::Embed::Author.new(message[:payload]['author'])
+      embed.footer = Discorb::Embed::Footer.new("via Web UI")
+      post_embed(channel, embed)
+    end
+  end
+
+  def broadcast_ai_chunk(message)
+    # Do nothing, as we don't stream to Discord
+  end
+
+  def broadcast_ai_end(message)
+    # Post the final AI response to the appropriate channel
+    target_channel = if message[:context] && message[:context][:discord_message]
+      message[:context][:discord_message].channel
+    else
+      get_designated_channel
+    end
+    
+    return unless target_channel
+    full_text = message[:payload]['text']
+    return if full_text.nil? || full_text.empty?
+
+    full_text.scan(/.{1,2000}/m).each do |chunk|
+      post_message(target_channel, chunk)
+    end
+  end
+
+  def broadcast_error(message)
+    # For now, we don't post errors to Discord to avoid spam.
+    # This could be changed to log to a specific admin channel.
+  end
+
+  # --- Helper Methods ---
+
+  def get_designated_channel
+    return nil unless @channel_id
+    @client.fetch_channel(@channel_id).wait
+  end
+
+  private
+
   def post_message(channel, message)
     channel.post(message).wait
   end
@@ -37,25 +89,6 @@ class DiscordGateway
     channel.post(embeds: [embed]).wait
   end
 
-  def get_designated_channel
-    return nil unless @channel_id
-    @client.fetch_channel(@channel_id).wait
-  end
-
-  def post_user_web_message(payload)
-    channel = get_designated_channel
-    return unless channel
-
-    embed = Discorb::Embed.new("")
-    embed.description = payload['text']
-    embed.color = Discorb::Color.from_hex("#7289da")
-    embed.author = Discorb::Embed::Author.new(payload['author'])
-    embed.footer = Discorb::Embed::Footer.new("via Web UI")
-    post_embed(channel, embed)
-  end
-
-  private
-
   def setup_events
     @client.once :standby do
       APP_LOGGER.info "[GW] discorb logged in as #{@client.user}"
@@ -63,7 +96,6 @@ class DiscordGateway
 
     @client.on :message do |message|
       next if message.author.bot?
-
       handle_history_command(message) || handle_regular_message(message)
     end
   end
@@ -107,8 +139,8 @@ class DiscordGateway
       'text' => message.content
     }
     
-    # Start AI processing, passing the original message for reply context
-    @ai_client.start_stream(payload, discord_message: message)
+    # Pass original message for reply context
+    @chat_orchestrator.start_stream(payload, context: { discord_message: message })
     true
   end
 end

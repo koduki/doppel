@@ -3,11 +3,11 @@ require 'faye/websocket'
 require 'json'
 
 class WebGateway
-  attr_writer :ai_client
+  attr_writer :chat_orchestrator
 
-  def initialize(chat_state, ai_client)
+  def initialize(chat_state, chat_orchestrator)
     @chat_state = chat_state
-    @ai_client = ai_client
+    @chat_orchestrator = chat_orchestrator
     @clients = []
   end
 
@@ -25,7 +25,7 @@ class WebGateway
         APP_LOGGER.info("[WEB_GW] Received message: #{event.data}")
         data = JSON.parse(event.data) rescue nil
         if data && data['type'] == 'user_message' && data['payload']
-          @ai_client.start_stream(data['payload'])
+          @chat_orchestrator.start_stream(data['payload'])
         else
           APP_LOGGER.warn("[WEB_GW] Invalid message format: #{event.data}")
         end
@@ -40,6 +40,26 @@ class WebGateway
       ws.rack_response
     end
   end
+
+  # --- Common Gateway Interface ---
+
+  def broadcast_user_message(message)
+    broadcast(message)
+  end
+
+  def broadcast_ai_chunk(message)
+    broadcast(message)
+  end
+
+  def broadcast_ai_end(message)
+    broadcast(message)
+  end
+
+  def broadcast_error(message)
+    broadcast(message)
+  end
+
+  private
 
   def broadcast(message)
     json_message = message.to_json
