@@ -48,7 +48,7 @@ class WebGateway
   end
 
   def broadcast_ai_chunk(message)
-    broadcast(message)
+    broadcast(message, log: false)
   end
 
   def broadcast_ai_end(message)
@@ -61,9 +61,9 @@ class WebGateway
 
   private
 
-  def broadcast(message)
+  def broadcast(message, log: true)
     json_message = message.to_json
-    APP_LOGGER.info("[WEB_GW] Broadcasting: #{json_message}")
+    APP_LOGGER.info("[WEB_GW] Broadcasting: #{json_message}") if log
     @clients.each { |c| c.send(json_message) }
   end
 end

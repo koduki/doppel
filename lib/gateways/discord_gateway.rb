@@ -63,7 +63,7 @@ class DiscordGateway
       
       next unless target_channel
       full_text = message[:payload]['text']
-      next if full_text.nil? || full_text.empty?
+      next if full_text.nil? || full_text.strip.empty?
 
       full_text.scan(/.{1,2000}/m).each do |chunk|
         post_message(target_channel, chunk)

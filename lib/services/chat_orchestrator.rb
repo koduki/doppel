@@ -44,8 +44,16 @@ class ChatOrchestrator
   end
 
   def process_in_backend(prompt, message_id, context)
-    session_id = create_session
-    return unless session_id
+    session_id = @chat_state.get_session_id
+
+    if session_id.nil?
+      APP_LOGGER.info("[ORCHESTRATOR] No session found. Creating a new one.")
+      session_id = create_session
+      return unless session_id
+      @chat_state.set_session_id(session_id)
+    else
+      APP_LOGGER.info("[ORCHESTRATOR] Reusing existing session: #{session_id}")
+    end
 
     this = self
     ws = WebSocket::Client::Simple.connect(@backend_ws_url)

@@ -2,8 +2,11 @@
 require 'thread'
 
 class ChatState
+  attr_reader :session_id
+
   def initialize(max_size: 50)
     @history = []
+    @session_id = nil
     @mutex = Mutex.new
     @max_size = max_size
   end
@@ -17,5 +20,13 @@ class ChatState
 
   def history
     @mutex.synchronize { @history.dup }
+  end
+
+  def get_session_id
+    @mutex.synchronize { @session_id }
+  end
+
+  def set_session_id(new_session_id)
+    @mutex.synchronize { @session_id = new_session_id }
   end
 end
