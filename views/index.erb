@@ -47,86 +47,151 @@
         </div>  
     </div>  
   
-    <script>  
-        let currentStream = null;
-  
-        function createSession() {  
-            addMessage('System', 'Ready.', 'system-message');  
-        }
-  
-        function sendMessage() {  
-            const input = document.getElementById('message-input');  
-            const message = input.value.trim();  
-            if (!message) return;  
-  
-            // 前のストリームがあれば閉じる
-            if (currentStream) { currentStream.close(); currentStream = null; }
-  
-            addMessage('You', message, 'user-message');  
-            addMessage('Gemini', '', 'ai-message');
-  
-            // 同一オリジンのSSEに接続
-            const url = `/stream?prompt=${encodeURIComponent(message)}`;
-            const es = new EventSource(url);
-            currentStream = es;
-  
-            es.onmessage = (e) => {
-                appendToLastMessage(e.data);
-            };
-            es.addEventListener('end', (e) => {
-                es.close();
-                currentStream = null;
-            });
-            es.addEventListener('error', (e) => {
-                const state = ['CONNECTING','OPEN','CLOSED'][es.readyState] || es.readyState;
-                addMessage('Error', `Streaming error. state=${state}`, 'error-message');
-                try {
-                  addMessage('Error', `event=${JSON.stringify(e)}`, 'error-message');
-                } catch {}
-                es.close();
-                currentStream = null;
-            });
+    <script>
+        const messagesDiv = document.getElementById('messages');
+        const input = document.getElementById('message-input');
+        let ws;
 
-            // サーバ側が送る backend_error イベント
-            es.addEventListener('backend_error', (e) => {
-                if (e.data) {
-                  addMessage('Backend', e.data, 'error-message');
+        // --- Optimized Rendering Globals ---
+        const updateQueue = new Map();
+        let isUpdateScheduled = false;
+
+        function initWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/`;
+
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                console.log('WebSocket connection established');
+                addSystemMessage('Connected to server.');
+            };
+
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                console.log('Received:', data);
+                switch (data.type) {
+                    case 'history':
+                        renderHistory(data.payload);
+                        break;
+                    case 'user_message':
+                        addMessage(data.payload.id, data.payload.author, data.payload.text, 'user-message');
+                        // Prepare a container for the AI response
+                        addMessage(data.payload.id + '-ai', 'AI', '', 'ai-message');
+                        break;
+                    case 'ai_chunk':
+                        scheduleUpdate(data.payload.id + '-ai', data.payload.text);
+                        break;
+                    case 'ai_end':
+                        // Ensure any remaining text in the queue is flushed
+                        processUpdateQueue();
+                        break;
+                    case 'error':
+                        addMessage(data.payload.id, 'Error', data.payload.message, 'error-message');
+                        break;
+                }
+            };
+
+            ws.onclose = () => {
+                console.log('WebSocket connection closed');
+                addSystemMessage('Connection lost. Attempting to reconnect in 3 seconds...');
+                setTimeout(initWebSocket, 3000);
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                addSystemMessage('WebSocket error. See console for details.');
+            };
+        }
+
+        function sendMessage() {
+            const text = input.value.trim();
+            if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+            const message = {
+                type: 'user_message',
+                payload: {
+                    source: 'web',
+                    author: 'You',
+                    text: text
+                }
+            };
+            ws.send(JSON.stringify(message));
+            input.value = '';
+        }
+        
+        function renderHistory(history) {
+            messagesDiv.innerHTML = ''; // Clear existing messages
+            history.forEach(msg => {
+                const { type, payload } = msg;
+                if (type === 'user_message') {
+                    addMessage(payload.id, payload.author, payload.text, 'user-message');
+                    addMessage(payload.id + '-ai', 'AI', '', 'ai-message');
+                } else if (type === 'ai_chunk') {
+                    // In history rendering, append directly without throttling
+                    appendToMessage(payload.id + '-ai', payload.text);
                 }
             });
-  
-            input.value = '';
-        }  
-  
-        function addMessage(sender, content, className) {  
-            const messagesDiv = document.getElementById('messages');  
-            const messageDiv = document.createElement('div');  
-            messageDiv.className = `message ${className}`;  
-            messageDiv.innerHTML = `<strong>${sender}:</strong> <span class="content">${content}</span>`;  
-            messagesDiv.appendChild(messageDiv);  
-            messagesDiv.scrollTop = messagesDiv.scrollHeight;  
-        }  
-  
-        function appendToLastMessage(content) {  
-            const messagesDiv = document.getElementById('messages');  
-            const lastMessage = messagesDiv.lastElementChild;  
-            if (lastMessage) {  
-                const contentSpan = lastMessage.querySelector('.content');  
-                if (contentSpan) {  
-                    contentSpan.textContent += content;  
-                }  
-            }  
-            messagesDiv.scrollTop = messagesDiv.scrollHeight;  
-        }  
-  
+             addSystemMessage('Chat history loaded.');
+        }
+
+        function addMessage(id, sender, content, className) {
+            const messageDiv = document.createElement('div');
+            messageDiv.id = 'msg-' + id;
+            messageDiv.className = `message ${className}`;
+            messageDiv.innerHTML = `<strong>${sender}:</strong> <span class="content">${content}</span>`;
+            messagesDiv.appendChild(messageDiv);
+            scrollToBottom();
+        }
+
+        function appendToMessage(id, content) {
+            const messageDiv = document.getElementById('msg-' + id);
+            if (messageDiv) {
+                const contentSpan = messageDiv.querySelector('.content');
+                if (contentSpan) {
+                    contentSpan.textContent += content;
+                }
+            }
+        }
+
+        function scheduleUpdate(id, content) {
+            if (!updateQueue.has(id)) {
+                updateQueue.set(id, '');
+            }
+            updateQueue.set(id, updateQueue.get(id) + content);
+
+            if (!isUpdateScheduled) {
+                isUpdateScheduled = true;
+                requestAnimationFrame(processUpdateQueue);
+            }
+        }
+
+        function processUpdateQueue() {
+            updateQueue.forEach((content, id) => {
+                appendToMessage(id, content);
+            });
+            updateQueue.clear();
+            isUpdateScheduled = false;
+            scrollToBottom();
+        }
+        
+        function addSystemMessage(content) {
+            addMessage('system', 'System', content, 'system-message');
+        }
+
+        function scrollToBottom() {
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
         // Send message on Enter key
-        document.getElementById('message-input').addEventListener('keypress', (e) => {  
-            if (e.key === 'Enter') {  
-                sendMessage();  
-            }  
-        });  
-  
-        // Create session on page load
-        createSession();  
+        input.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                sendMessage();
+            }
+        });
+
+        // Initialize WebSocket connection on page load
+        initWebSocket();
     </script>  
 </body>  
 </html>
