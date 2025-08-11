@@ -2,6 +2,7 @@
 require 'sinatra'
 require 'sinatra/json'
 require 'logger'
+require 'uri'
 
 # --- Load Components ---
 require_relative 'lib/chat_state'
@@ -68,6 +69,9 @@ get '/' do
   if Faye::WebSocket.websocket?(request.env)
     web_gateway.handle_request(request.env)
   else
+    uri = URI.parse(APP_BACKEND_ORIGIN)
+    uri.port = 8000
+    @web_ide_url = uri.to_s
     erb :index
   end
 end
